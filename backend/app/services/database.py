@@ -31,21 +31,62 @@ class DatabaseService:
             cursor = conn.cursor()
 
             # 1. 创建会话表
-            cursor.execute("""CREATE TABLE IF NOT EXISTS sessions(
-                               thread_id TEXT PRIMARY KEY,
-                               user_id TEXT NOT NULL, 
-                               name TEXT NOT NULL,
-                               created_at TEXT NOT NULL,
-                               updated_at TEXT NOT NULL)""")
+            cursor.execute("""CREATE TABLE IF NOT EXISTS sessions
+                              (
+                                  thread_id
+                                  TEXT
+                                  PRIMARY
+                                  KEY,
+                                  user_id
+                                  TEXT
+                                  NOT
+                                  NULL,
+                                  name
+                                  TEXT
+                                  NOT
+                                  NULL,
+                                  created_at
+                                  TEXT
+                                  NOT
+                                  NULL,
+                                  updated_at
+                                  TEXT
+                                  NOT
+                                  NULL
+                              )""")
 
             # 2. 创建消息表
-            cursor.execute("""CREATE TABLE IF NOT EXISTS messages(
-                               id INTEGER PRIMARY KEY AUTOINCREMENT,
-                               thread_id TEXT NOT NULL,
-                               role TEXT NOT NULL,
-                               content TEXT NOT NULL,
-                               timestamp TEXT NOT NULL,
-                               FOREIGN KEY( thread_id ) REFERENCES sessions (thread_id) ON DELETE CASCADE)""")
+            cursor.execute("""CREATE TABLE IF NOT EXISTS messages
+            (
+                id
+                INTEGER
+                PRIMARY
+                KEY
+                AUTOINCREMENT,
+                thread_id
+                TEXT
+                NOT
+                NULL,
+                role
+                TEXT
+                NOT
+                NULL,
+                content
+                TEXT
+                NOT
+                NULL,
+                timestamp
+                TEXT
+                NOT
+                NULL,
+                FOREIGN
+                KEY
+                              (
+                thread_id
+                              ) REFERENCES sessions
+                              (
+                                  thread_id
+                              ) ON DELETE CASCADE)""")
 
             # 3. 创建索引（提高查询性能）
             cursor.execute("""
@@ -63,7 +104,7 @@ class DatabaseService:
 
     # ==================== 会话操作 ====================
 
-    def create_session(self, thread_id: str, user_id: str = "default", name: str = "新对话") -> bool:
+    def create_session(self, thread_id: str, user_id: str = "default", name: str = "新对话") -> Dict:
         """创建新会话"""
         conn = self._get_connection()
         cursor = conn.cursor()
@@ -77,10 +118,16 @@ class DatabaseService:
                            """, (thread_id, user_id, name, now, now))
             conn.commit()
             print("会话创建成功")
-            return True
+            return {
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "name": name,
+                "created_at": now,
+                "updated_at": now
+            }
         except sqlite3.IntegrityError:
             # 会话已存在
-            return False
+            return {}
         finally:
             conn.close()
 
@@ -278,5 +325,5 @@ class DatabaseService:
 
         return affected > 0
 
-db = DatabaseService()
 
+db = DatabaseService()

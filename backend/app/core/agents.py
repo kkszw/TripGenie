@@ -7,22 +7,28 @@ from langchain_core.runnables import RunnableConfig
 from app.core.state import TripState, IntentOutput
 from app.config import settings
 from app.rag.retriever import *
-from app.core.tools import get_weather_tool, retrieve_guides_tool
 from langgraph.graph import END
-from app.mcp.client import getAllClientTools
-
-
-tools = [get_weather_tool, retrieve_guides_tool]  + getAllClientTools()   # 组成工具数组
-tools_by_name = {t.name: t for t in tools}  # 组成工具名和工具的映射，方便查找工具
+from app.mcp.client import getAllTools
 
 llm = ChatTongyi(model=settings.DASHSCOPE_MODEL, api_key=settings.DASHSCOPE_API_KEY, streaming=True)
 llm_with_structure = llm.with_structured_output(IntentOutput)
-model_with_tools = llm.bind_tools(tools)   # 绑定工具到模型
+
+tools = None
+tools_by_name = None
+model_with_tools = None
+
+
+async def initialized_tools():
+    global tools, tools_by_name, model_with_tools
+    tools = await getAllTools()  # 组成工具数组
+    tools_by_name = {t.name: t for t in tools}
+    model_with_tools = llm.bind_tools(tools)
 
 
 async def classify_input(state: TripState):
     """分析用户的输入并路由到目标节点"""
     user_input = state["user_input"]
+    await initialized_tools()
     system_prompt = """
        你是一个意图分类器。分析用户输入，判断意图类型。
 
@@ -271,7 +277,6 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
                     "content": content
                 })
 
-
     try:
         data = json.loads(full_response)
         print("/*" * 20)
@@ -360,7 +365,6 @@ async def tool_node(state: TripState):
 
     for i, tool_call in enumerate(tool_calls):
         print(f"🔧 执行工具 {i + 1}/{len(tool_calls)}: {tool_call['name']}")
-
 
         tool = tools_by_name.get(tool_call["name"])
         if not tool:

@@ -11,13 +11,22 @@ def update_session_title(thread_id: str, request: SessionUpdate):
     """更新目标会话的标题名"""
     return db.update_session_name(thread_id, request.title)
 
+
 @router.post("/sessions", response_model=SessionResponse, tags=["会话"])
 def create_new_session(session: SessionCreate):
     """创建新会话"""
     thread_id = str(uuid.uuid4())
     user_id = session.user_id
     name = session.name
-    return db.create_session(thread_id, user_id, name)
+    session_data = db.create_session(thread_id, user_id, name)
+    return SessionResponse(
+        thread_id=session_data["thread_id"],
+        user_id=session_data["user_id"],
+        name=session_data["name"],
+        created_at=session_data["created_at"],
+        updated_at=session_data["updated_at"]
+    )
+
 
 @router.get("/", tags=["会话"])
 async def get_history(user_id: str = "default"):

@@ -2,11 +2,15 @@
 import asyncio
 import sys
 from pathlib import Path
-
+from typing import Any, List
+from langchain_core.tools import BaseTool
 from app.config import settings
 from app.core.tools import get_weather_tool, retrieve_guides_tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
+DISABLED_MCP_TOOLS = [
+    "maps_weather",
+]
 
 async def getAllClientTools():
     mcp_tools = []
@@ -45,21 +49,30 @@ async def getAllClientTools():
 
     try:
         amap_mcp_tools = await amap_mcp_tool.get_tools()
+        amap_mcp_tools = filter_tools(amap_mcp_tools)
         time_mcp_tools = await time_mcp_tool.get_tools()
         mcp_tools += time_mcp_tools
         mcp_tools += amap_mcp_tools
     except Exception as e:
-        print(f"加载 time MCP 工具失败: {e}")
+        print(f"加载MCP工具失败: {e}")
 
     return mcp_tools
 
 
-async def main():
+def filter_tools(tools: List[BaseTool]) -> List[BaseTool]:
+    """过滤工具"""
+    filtered = []
+
+    for tool in tools:
+        # 1. 精确匹配禁用列表
+        if tool.name in DISABLED_MCP_TOOLS:
+            continue
+
+        filtered.append(tool)
+
+    return filtered
+
+async def getAllTools() -> list[Any]:
     mcp_tools = await getAllClientTools()
     tools = [get_weather_tool, retrieve_guides_tool] + mcp_tools
-    print(f"所有工具数量: {len(tools)}")
-    print(f"所有工具: {tools}")
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    return tools
