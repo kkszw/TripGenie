@@ -29,7 +29,7 @@
       </div>
     </div>
 
-    <!-- 每日行程概览（折叠显示） -->
+    <!-- 每日行程概览 -->
     <div class="plan-days-preview">
       <div v-for="(day, index) in plan.days.slice(0, 2)" :key="index" class="day-preview-item">
         <span class="day-preview-number">Day {{ day.day || index + 1 }}</span>
@@ -41,7 +41,7 @@
       </div>
     </div>
 
-    <!-- 操作按钮 - 点击展开完整行程 -->
+    <!-- 操作按钮 -->
     <div class="plan-actions">
       <button class="btn-expand" @click="$emit('expand', plan)">
         👆 点击查看完整行程
@@ -98,9 +98,7 @@ defineEmits(['expand'])
   gap: 8px;
 }
 
-.plan-icon {
-  font-size: 20px;
-}
+.plan-icon { font-size: 20px; }
 
 .plan-meta {
   display: flex;
@@ -109,12 +107,8 @@ defineEmits(['expand'])
   color: #4a5568;
 }
 
-.plan-budget {
-  color: #10b981;
-  font-weight: 500;
-}
+.plan-budget { color: #10b981; font-weight: 500; }
 
-/* 精简信息 */
 .plan-preview {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -132,10 +126,7 @@ defineEmits(['expand'])
   border-radius: 8px;
 }
 
-.preview-label {
-  font-size: 11px;
-  color: #9ca3af;
-}
+.preview-label { font-size: 11px; color: #9ca3af; }
 
 .preview-value {
   font-size: 14px;
@@ -144,10 +135,7 @@ defineEmits(['expand'])
   margin-top: 2px;
 }
 
-/* 行程概览 */
-.plan-days-preview {
-  padding: 8px 0;
-}
+.plan-days-preview { padding: 8px 0; }
 
 .day-preview-item {
   display: flex;
@@ -173,10 +161,7 @@ defineEmits(['expand'])
   color: #1a1a2e;
 }
 
-.day-preview-count {
-  font-size: 12px;
-  color: #9ca3af;
-}
+.day-preview-count { font-size: 12px; color: #9ca3af; }
 
 .day-preview-more {
   text-align: center;
@@ -186,7 +171,6 @@ defineEmits(['expand'])
   font-style: italic;
 }
 
-/* 操作按钮 */
 .plan-actions {
   margin-top: 10px;
   padding-top: 10px;
@@ -212,37 +196,13 @@ defineEmits(['expand'])
   box-shadow: 0 4px 16px rgba(79, 110, 247, 0.35);
 }
 
-/* 响应式 */
 @media (max-width: 640px) {
-  .trip-plan-card {
-    padding: 14px 16px;
-  }
-
-  .plan-title {
-    font-size: 14px;
-  }
-
-  .plan-meta {
-    font-size: 12px;
-    gap: 8px;
-  }
-
-  .plan-preview {
-    grid-template-columns: repeat(3, 1fr);
-    gap: 4px;
-  }
-
-  .preview-value {
-    font-size: 12px;
-  }
-
-  .day-preview-item {
-    font-size: 12px;
-  }
-
-  .btn-expand {
-    font-size: 13px;
-    padding: 6px 16px;
-  }
+  .trip-plan-card { padding: 14px 16px; }
+  .plan-title { font-size: 14px; }
+  .plan-meta { font-size: 12px; gap: 8px; }
+  .plan-preview { grid-template-columns: repeat(3, 1fr); gap: 4px; }
+  .preview-value { font-size: 12px; }
+  .day-preview-item { font-size: 12px; }
+  .btn-expand { font-size: 13px; padding: 6px 16px; }
 }
 </style>

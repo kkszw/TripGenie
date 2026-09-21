@@ -32,50 +32,64 @@
 
           <!-- 滑动容器 -->
           <div class="modal-carousel-wrapper">
-            <div class="modal-carousel" :style="carouselStyle" @touchstart="onTouchStart" @touchmove="onTouchMove" @touchend="onTouchEnd">
+            <div class="modal-carousel" :style="carouselStyle" @touchstart="onTouchStart" @touchmove="onTouchMove"
+                 @touchend="onTouchEnd">
               <div v-for="(day, index) in plan.days" :key="index" class="modal-day-card">
-                <div class="modal-day-header">
-                  <div class="modal-day-info">
-                    <span class="modal-day-number">Day {{ day.day || index + 1 }}</span>
-                    <span v-if="day.date" class="modal-day-date">{{ day.date }}</span>
-                  </div>
-                  <span class="modal-day-theme">{{ day.theme || `第 ${day.day || index + 1} 天` }}</span>
-                  <span v-if="day.estimatedCost" class="modal-day-cost">
-                    预估 ¥{{ day.estimatedCost }}
-                  </span>
-                </div>
-
-                <!-- 每日天气 -->
-                <div v-if="day.weather" class="modal-day-weather">
-                  <span class="weather-icon">🌤️</span>
-                  <span class="weather-text">{{ day.weather }}</span>
-                </div>
-
-                <!-- 活动列表 -->
-                <div class="modal-day-activities">
-                  <div v-for="(act, actIndex) in day.attractions" :key="actIndex" class="modal-activity-item">
-                    <span v-if="act.time" class="modal-activity-time">{{ act.time }}</span>
-                    <div class="modal-activity-detail">
-                      <span class="modal-activity-name">{{ act.name }}</span>
-                      <span v-if="act.description" class="modal-activity-desc">{{ act.description }}</span>
+                <!-- ✅ 内层滚动容器 -->
+                <div class="modal-day-scroll">
+                  <div class="modal-day-header">
+                    <div class="modal-day-info">
+                      <span class="modal-day-number">Day {{ day.day || index + 1 }}</span>
+                      <span v-if="day.date" class="modal-day-date">{{ day.date }}</span>
                     </div>
-                    <span v-if="act.cost" class="modal-activity-cost">¥{{ act.cost }}</span>
+                    <span class="modal-day-theme">{{ day.theme || `第 ${day.day || index + 1} 天` }}</span>
+                    <span v-if="day.estimatedCost" class="modal-day-cost">
+                      预估 ¥{{ day.estimatedCost }}
+                    </span>
                   </div>
-                </div>
 
-                <!-- 住宿 -->
-                <div v-if="day.hotel && day.hotel !== '待定'" class="modal-day-hotel">
-                  🏨 {{ day.hotel }}
-                </div>
+                  <!-- 每日天气 -->
+                  <div v-if="day.weather" class="modal-day-weather">
+                    <span class="weather-icon">🌤️</span>
+                    <span class="weather-text">{{ day.weather }}</span>
+                  </div>
 
-                <!-- 备注 -->
-                <div v-if="day.notes" class="modal-day-notes">
-                  📝 {{ day.notes }}
-                </div>
+                  <!-- 活动列表 -->
+                  <div class="modal-day-activities">
+                    <div v-for="(act, actIndex) in day.attractions" :key="actIndex" class="modal-activity-item">
+                      <span v-if="act.time" class="modal-activity-time">{{ act.time }}</span>
+                      <div class="modal-activity-detail">
+                        <span class="modal-activity-name">{{ act.name }}</span>
+                        <span v-if="act.description" class="modal-activity-desc">{{ act.description }}</span>
+                      </div>
+                      <span v-if="act.cost" class="modal-activity-cost">¥{{ act.cost }}</span>
+                    </div>
+                  </div>
 
-                <!-- 页码 -->
-                <div class="modal-day-page">
-                  {{ index + 1 }} / {{ plan.days.length }}
+                  <!-- 住宿 -->
+                  <div v-if="day.hotel && day.hotel !== '待定'" class="modal-day-hotel">
+                    🏨 {{ day.hotel }}
+                  </div>
+
+                  <!-- 备注 -->
+                  <div v-if="day.notes" class="modal-day-notes">
+                    📝 {{ day.notes }}
+                  </div>
+
+                  <!-- ✅ 当日地图（放在行程描述下方） -->
+                  <DayMap
+                      v-if="currentIndex === index && getDayAttractions(day.day || index + 1).length > 0"
+                      :key="`day-map-${index}-${currentIndex}`"
+                      :day="day.day || index + 1"
+                      :attractions="getDayAttractions(day.day || index + 1)"
+                      :routes="getDayRoutes(day.day || index + 1)"
+                      :destination="plan.destination"
+                  />
+
+                  <!-- 页码 -->
+                  <div class="modal-day-page">
+                    {{ index + 1 }} / {{ plan.days.length }}
+                  </div>
                 </div>
               </div>
             </div>
@@ -84,7 +98,7 @@
           <!-- 底部指示器 -->
           <div class="modal-dots">
             <span
-                v-for="(day, index) in plan.days"
+                v-for="(_, index) in totalPages"
                 :key="index"
                 class="modal-dot"
                 :class="{ active: currentIndex === index }"
@@ -99,16 +113,17 @@
                 <path d="M15 18L9 12L15 6" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
             </button>
-            <button class="modal-nav-btn next" @click="nextDay" :disabled="currentIndex === plan.days.length - 1">
+            <button class="modal-nav-btn next" @click="nextDay" :disabled="currentIndex === totalPages - 1">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                 <path d="M9 18L15 12L9 6" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
             </button>
           </div>
 
-          <!-- 底部操作 -->
+          <!-- 底部 -->
           <div class="modal-footer">
-            
+            <span class="modal-footer-hint">← 左右滑动查看全部 {{ totalPages }} 页</span>
+            <button class="modal-btn-close" @click="close">关闭</button>
           </div>
         </div>
       </div>
@@ -117,7 +132,8 @@
 </template>
 
 <script setup>
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
+import {ref, computed, watch, onMounted, onUnmounted} from 'vue'
+import DayMap from './DayMap.vue'  // ✅ 导入 DayMap
 
 const props = defineProps({
   visible: {
@@ -139,6 +155,9 @@ const touchCurrentX = ref(0)
 const isDragging = ref(false)
 
 // ===== 计算 =====
+// 现在总页数 = 天数（不再有单独的地图页）
+const totalPages = computed(() => props.plan.days.length)
+
 const carouselStyle = computed(() => {
   const offset = -currentIndex.value * 100
   return {
@@ -147,6 +166,23 @@ const carouselStyle = computed(() => {
   }
 })
 
+// ✅ 获取某天的景点
+const getDayAttractions = (dayNum) => {
+  if (!props.plan.map_data || !props.plan.map_data.attractions) return []
+  return props.plan.map_data.attractions.filter(a => a.day === dayNum)
+}
+
+// ✅ 获取某天的路线（起点在当天的景点）
+const getDayRoutes = (dayNum) => {
+  if (!props.plan.map_data || !props.plan.map_data.routes) return []
+  const dayAttractions = getDayAttractions(dayNum)
+  const dayNames = dayAttractions.map(a => a.name)
+
+  return props.plan.map_data.routes.filter(route => {
+    return dayNames.includes(route.from)
+  })
+}
+
 // ===== 方法 =====
 const close = () => {
   emit('update:visible', false)
@@ -154,13 +190,13 @@ const close = () => {
 }
 
 const goToDay = (index) => {
-  if (index >= 0 && index < props.plan.days.length) {
+  if (index >= 0 && index < totalPages.value) {
     currentIndex.value = index
   }
 }
 
 const nextDay = () => {
-  if (currentIndex.value < props.plan.days.length - 1) {
+  if (currentIndex.value < totalPages.value - 1) {
     currentIndex.value++
   }
 }
@@ -185,27 +221,19 @@ const onTouchMove = (e) => {
 const onTouchEnd = () => {
   if (!isDragging.value) return
   isDragging.value = false
-
   const diff = touchStartX.value - touchCurrentX.value
   if (Math.abs(diff) > 50) {
-    if (diff > 0) {
-      nextDay()
-    } else {
-      prevDay()
-    }
+    if (diff > 0) nextDay()
+    else prevDay()
   }
 }
 
 // ===== 键盘事件 =====
 const handleKeydown = (e) => {
   if (!props.visible) return
-  if (e.key === 'Escape') {
-    close()
-  } else if (e.key === 'ArrowLeft') {
-    prevDay()
-  } else if (e.key === 'ArrowRight') {
-    nextDay()
-  }
+  if (e.key === 'Escape') close()
+  else if (e.key === 'ArrowLeft') prevDay()
+  else if (e.key === 'ArrowRight') nextDay()
 }
 
 // ===== 重置索引 =====
@@ -213,9 +241,19 @@ watch(() => props.visible, (newVal) => {
   if (newVal) {
     currentIndex.value = 0
     document.body.style.overflow = 'hidden'
+
+    // ✅ 弹窗打开后，延迟触发 resize，让地图重新计算尺寸
+    setTimeout(() => {
+      window.dispatchEvent(new Event('resize'))
+    }, 600)
   } else {
     document.body.style.overflow = ''
   }
+})
+watch(() => currentIndex.value, (newIndex) => {
+  setTimeout(() => {
+    window.dispatchEvent(new Event('resize'))
+  }, 150)
 })
 
 // ===== 生命周期 =====
@@ -233,10 +271,7 @@ onUnmounted(() => {
 /* ===== 遮罩层 ===== */
 .modal-overlay {
   position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  inset: 0;
   background: rgba(0, 0, 0, 0.6);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
@@ -364,23 +399,39 @@ onUnmounted(() => {
 /* ===== 每日卡片 ===== */
 .modal-day-card {
   flex: 0 0 100%;
-  padding: 0 24px 16px;
-  overflow-y: auto;
+  padding: 0 24px;
+  overflow: hidden; /* 外卡片不滚动 */
   max-height: 55vh;
+  height: 55vh; /* 固定高度让内层滚动 */
 }
 
-/* 滚动条 */
-.modal-day-card::-webkit-scrollbar {
-  width: 4px;
+/* ✅ 内层滚动容器 */
+.modal-day-scroll {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 8px;
+  padding-bottom: 16px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.15) transparent;
 }
 
-.modal-day-card::-webkit-scrollbar-track {
+.modal-day-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+
+.modal-day-scroll::-webkit-scrollbar-track {
   background: transparent;
+  margin: 4px 0;
 }
 
-.modal-day-card::-webkit-scrollbar-thumb {
-  background: #d1d5db;
-  border-radius: 2px;
+.modal-day-scroll::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.15);
+  border-radius: 3px;
+}
+
+.modal-day-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.3);
 }
 
 .modal-day-header {
@@ -681,8 +732,9 @@ onUnmounted(() => {
   }
 
   .modal-day-card {
-    padding: 0 16px 12px;
-    max-height: 50vh;
+    padding: 0 16px;
+    max-height: 60vh;
+    height: 60vh;
   }
 
   .modal-day-number {

@@ -1,4 +1,5 @@
 # app/services/database.py
+import json
 import sqlite3
 from pathlib import Path
 from datetime import datetime
@@ -57,36 +58,19 @@ class DatabaseService:
 
             # 2. 创建消息表
             cursor.execute("""CREATE TABLE IF NOT EXISTS messages
-            (
-                id
-                INTEGER
-                PRIMARY
-                KEY
-                AUTOINCREMENT,
-                thread_id
-                TEXT
-                NOT
-                NULL,
-                role
-                TEXT
-                NOT
-                NULL,
-                content
-                TEXT
-                NOT
-                NULL,
-                timestamp
-                TEXT
-                NOT
-                NULL,
-                FOREIGN
-                KEY
-                              (
-                thread_id
-                              ) REFERENCES sessions
-                              (
-                                  thread_id
-                              ) ON DELETE CASCADE)""")
+            (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                map_data TEXT,
+                timestamp TEXT NOT NULL,
+                FOREIGN KEY (thread_id) REFERENCES sessions(thread_id) ON DELETE CASCADE)""")
+
+            cursor.execute("PRAGMA table_info(messages)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "map_data" not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN map_data TEXT")
+                print("✅ 已自动添加 map_data 字段")
 
             # 3. 创建索引（提高查询性能）
             cursor.execute("""
@@ -193,7 +177,7 @@ class DatabaseService:
 
     # ==================== 消息操作 ====================
 
-    def add_message(self, thread_id: str, role: str, content: str) -> bool:
+    def add_message(self, thread_id: str, role: str, content: str, map_data: dict = None) -> bool:
         """
         添加消息到会话
 
@@ -201,15 +185,17 @@ class DatabaseService:
             thread_id: 会话ID
             role: 'user' 或 'assistant'
             content: 消息内容
+            map_data: 地图数据（可选，只有旅行规划消息才有）
         """
         conn = self._get_connection()
         cursor = conn.cursor()
+        map_data_json = json.dumps(map_data, ensure_ascii=False) if map_data else None
 
         # 1. 插入消息
         cursor.execute("""
-                       INSERT INTO messages (thread_id, role, content, timestamp)
-                       VALUES (?, ?, ?, ?)
-                       """, (thread_id, role, content, datetime.now().isoformat()))
+                       INSERT INTO messages (thread_id, role, content, timestamp, map_data)
+                       VALUES (?, ?, ?, ?, ?)
+                       """, (thread_id, role, content, datetime.now().isoformat(), map_data_json))
 
         # 2. 更新会话的 updated_at
         cursor.execute("""

@@ -129,6 +129,7 @@
         </div>
 
         <TripPlanModal
+            v-if="selectedPlan"
             v-model:visible="showModal"
             :plan="selectedPlan"
             @close="closeModal"
@@ -232,6 +233,7 @@ const selectedPlan = ref(null)
 
 // ===== 显示行程详情（打开弹窗） =====
 const showPlanDetail = (plan) => {
+  if (!plan) return
   selectedPlan.value = plan
   showModal.value = true
 }
@@ -312,22 +314,24 @@ const loadSessionMessagesFromDB = async (threadId) => {
 
       // 如果是 AI 消息
       if (message.role === 'assistant') {
-        // 1. 优先使用数据库中已有的 tripPlan
-        if (msg.tripPlan) {
-          message.tripPlan = msg.tripPlan
-        }
-        // 2. 检查是否有行程数据在 content 中
-        else if (message.content) {
+        // 1. 从 content 解析行程
+        if (message.content) {
           const plan = parseTripPlanFromMessage(message.content)
           if (plan) {
             message.tripPlan = plan
           }
         }
-        // 3. 检查是否直接存储了行程数据在单独字段
-        else if (msg.plan || msg.itinerary) {
-          const plan = convertToTripPlan(msg.plan || msg)
-          if (plan) {
-            message.tripPlan = plan
+
+        // ✅ 2. 如果数据库里存了 map_data，附加到 tripPlan 上
+        if (message.tripPlan && msg.map_data) {
+          try {
+            const mapData = typeof msg.map_data === 'string'
+              ? JSON.parse(msg.map_data)
+              : msg.map_data
+            message.tripPlan.map_data = mapData
+            console.log('✅ 附加 map_data:', mapData.attractions?.length || 0, '个景点')
+          } catch (e) {
+            console.warn('⚠️ 解析 map_data 失败:', e)
           }
         }
       }
@@ -337,8 +341,8 @@ const loadSessionMessagesFromDB = async (threadId) => {
 
     // 日志统计
     const planCount = messages.value.filter(m => m.tripPlan).length
-    if (planCount > 0) {
-    }
+    const mapCount = messages.value.filter(m => m.tripPlan?.map_data).length
+    console.log(`📊 加载完成: ${messages.value.length} 条消息, ${planCount} 个行程, ${mapCount} 个地图`)
 
     scrollToBottom()
 
@@ -540,13 +544,22 @@ const handleSSEEvent = (data, aiMessage) => {
       break
 
     case 'trip_plan':
+      console.log('📦 收到 trip_plan 事件:', data)
       if (isLoading.value) {
         isLoading.value = false
       }
 
       const plan = data.plan
+      console.log('📋 plan 数据:', plan)
+      console.log('🗺️ map_data 是否存在:', !!plan.map_data)
+      if (plan.map_data) {
+        console.log('🗺️ map_data 内容:', plan.map_data)
+        console.log('📍 景点数量:', plan.map_data.attractions?.length)
+      }
       if (plan && currentIndex >= 0 && messages.value[currentIndex]?.role === 'assistant') {
         const tripPlan = convertToTripPlan(plan)
+        console.log('📋 转换后的 tripPlan:', tripPlan)
+        console.log('🗺️ tripPlan.map_data:', tripPlan.map_data)
         const currentMsg = messages.value[currentIndex]
 
         stopDisplayTimer()
@@ -933,8 +946,7 @@ const convertToTripPlan = (data) => {
   if (!daysData || !Array.isArray(daysData) || daysData.length === 0) {
     return null
   }
-
-  return {
+  const result = {
     id: Date.now() + Math.random() * 1000,
     destination: data.destination || '未知目的地',
     totalDays: data.totalDays || data.days?.length || data.itinerary?.length || 3,
@@ -967,6 +979,15 @@ const convertToTripPlan = (data) => {
     highlights: data.tips || data.travel_tips || data.highlights || ['特色美食', '文化体验', '舒适住宿'],
     budgetSummary: data.budgetSummary || data.budget_summary || null
   }
+   // ✅ 添加地图数据
+  if (data.map_data) {
+    result.map_data = data.map_data
+    console.log('🗺️ map_data 已添加到 tripPlan:', result.map_data)
+  } else {
+    console.log('⚠️ 没有 map_data')
+  }
+
+  return result
 }
 
 // ===== 中断决策 =====

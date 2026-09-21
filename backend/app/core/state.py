@@ -54,6 +54,7 @@ class TripState(TypedDict):
     draft_plan: Optional[List[DayPlan]]
     final_plan: Optional[List[DayPlan]]
     response: str
+    map_data: Dict
 
     # 流程控制 目前状态 错误情况 用户反馈
     current_step: str
