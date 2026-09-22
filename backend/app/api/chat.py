@@ -13,7 +13,7 @@ router = APIRouter()
 
 @router.post("/stream")
 async def send_chat(request: ChatRequest):
-    """发送聊天消息，使用 SSE 流式返回 Agent 响应。同时处理 HITL 中断决策。"""
+    """发送聊天消息，使用 SSE 流式返回 Agent 响应。"""
     if not request.thread_id:
         request.thread_id = str(uuid.uuid4())
         db.create_session(request.thread_id, "default", "新对话")

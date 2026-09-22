@@ -97,17 +97,12 @@ export const api = {
     },
 
     // ✅ 发送消息（流式）- 这个就是 sendMessage
-    sendMessage: async function (threadId, message, interruptDecision = null) {
+    sendMessage: async function (threadId, message) {
         const body = {
             thread_id: threadId,
             message: message,
-            context: {},
-            interrupt_decision: null
+            context: {}
         };
-
-        if (interruptDecision) {
-            body.interrupt_decision = interruptDecision;
-        }
 
         const response = await fetch(`${API_BASE}/api/chat/stream`, {
             method: 'POST',

@@ -135,24 +135,6 @@
             @close="closeModal"
         />
 
-        <!-- 中断弹窗（HITL） -->
-        <div v-if="showInterruptModal" class="interrupt-modal-overlay">
-          <div class="interrupt-modal">
-            <h3>需要你的确认</h3>
-            <div class="interrupt-content">
-              <p>{{ interruptMessage }}</p>
-              <div v-if="interruptDetails" class="interrupt-details">
-                <pre>{{ JSON.stringify(interruptDetails, null, 2) }}</pre>
-              </div>
-            </div>
-            <div class="interrupt-actions">
-              <button class="btn-cancel" @click="closeInterruptModal">取消</button>
-              <button class="btn-approve" @click="approveInterrupt">✅ 批准</button>
-              <button class="btn-reject" @click="rejectInterrupt">❌ 拒绝</button>
-            </div>
-          </div>
-        </div>
-
         <div ref="bottomRef" style="height: 1px;"></div>
       </div>
     </div>
@@ -242,11 +224,6 @@ const showPlanDetail = (plan) => {
 const closeModal = () => {
   showModal.value = false
 }
-// 中断相关
-const showInterruptModal = ref(false)
-const interruptMessage = ref('')
-const interruptDetails = ref(null)
-let pendingInterrupt = null
 
 // ===== 流式输出速度控制 =====
 const displayBuffer = ref('')  // 待显示的内容缓冲区
@@ -531,16 +508,6 @@ const handleSSEEvent = (data, aiMessage) => {
       if (!displayInterval.value) {
         startDisplayTimer(aiMessage)
       }
-      break
-
-    case 'interrupt':
-      if (isLoading.value) {
-        isLoading.value = false
-      }
-      pendingInterrupt = data.interrupt
-      showInterruptModal.value = true
-      interruptMessage.value = data.interrupt?.message || '需要你的确认'
-      interruptDetails.value = data.interrupt
       break
 
     case 'trip_plan':
@@ -988,74 +955,6 @@ const convertToTripPlan = (data) => {
   }
 
   return result
-}
-
-// ===== 中断决策 =====
-const closeInterruptModal = () => {
-  showInterruptModal.value = false
-  pendingInterrupt = null
-}
-
-const approveInterrupt = () => {
-  closeInterruptModal()
-  sendInterruptDecision({type: 'approve'})
-}
-
-const rejectInterrupt = () => {
-  closeInterruptModal()
-  sendInterruptDecision({type: 'reject', message: '用户拒绝了操作'})
-}
-
-const sendInterruptDecision = async (decision) => {
-  const threadId = props.threadId || currentThreadId.value
-  if (!threadId) return
-
-  isLoading.value = true
-
-  const aiMessage = {
-    role: 'assistant',
-    content: '',
-    timestamp: new Date().toISOString()
-  }
-  messages.value.push(aiMessage)
-
-  try {
-    const response = await api.sendMessage(threadId, '', decision)
-
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-
-    while (true) {
-      const {done, value} = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, {stream: true})
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6))
-            handleSSEEvent(data, aiMessage)
-            const lastMsg = messages.value[messages.value.length - 1]
-            if (lastMsg && lastMsg.role === 'assistant') {
-              lastMsg.content = aiMessage.content
-            }
-            await loadSessions()
-            scrollToBottom()
-          } catch (e) {
-            // 忽略非 JSON 行
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.error('❌ 中断决策失败:', error)
-    aiMessage.content = `处理中断决策失败: ${error.message}`
-    isLoading.value = false
-  }
 }
 
 // ===== 自动调整输入框 =====
@@ -1516,59 +1415,6 @@ onUnmounted(() => {
   color: #9ca3af;
   pointer-events: none;
   padding: 0 4px;
-}
-
-/* ===== 中断弹窗 ===== */
-.interrupt-modal-overlay {
-  position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  background: rgba(0, 0, 0, 0.5);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1000;
-}
-
-.interrupt-modal {
-  background: #ffffff;
-  border-radius: 16px;
-  padding: 24px;
-  max-width: 500px;
-  width: 90%;
-  max-height: 80vh;
-  overflow-y: auto;
-}
-
-.interrupt-actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 16px;
-}
-
-.interrupt-actions button {
-  padding: 8px 16px;
-  border: none;
-  border-radius: 8px;
-  cursor: pointer;
-  font-size: 14px;
-}
-
-.btn-cancel {
-  background: #e5e7eb;
-  color: #1a1a1a;
-}
-
-.btn-approve {
-  background: #22c55e;
-  color: white;
-}
-
-.btn-reject {
-  background: #ef4444;
-  color: white;
 }
 
 /* ===== 响应式 ===== */

@@ -6,5 +6,4 @@ from typing import List, Optional, Dict, Any, Annotated
 class ChatRequest(BaseModel):
     message: str = Field(description="对话内容")
     thread_id: Optional[str] = Field(description="会话编号")
-    context: Optional[Dict[str, Any]] = Field(description="用户的长期习惯")    # 用户的长期习惯
-    interrupt_decision: Optional[Dict[str, Any]] = Field(description="用户的中断操作")     # 用户的中断操作
+    context: Optional[Dict[str, Any]] = Field(description="用户的长期习惯")
