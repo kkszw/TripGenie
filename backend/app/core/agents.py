@@ -423,8 +423,8 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
         geo_tool = tools_by_name.get("maps_geo")
         attractions_with_coords = []
 
-        # 默认坐标（大连）
-        base_lng, base_lat = 121.6186, 38.9146
+        # 地理编码失败时的兜底坐标（见 .env 的 DEFAULT_MAP_LNG/LAT）
+        base_lng, base_lat = settings.default_map_lng, settings.default_map_lat
         # 提取城市名（用于限定地理搜索范围）
         destination = state.get("destination", "")
         city_name = destination
@@ -541,11 +541,20 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
                     })
                     existing_names.add(point)
                     print(f"➕ 补全景点: {point} ({coord})")
+        # 地图中心取所有已定位景点的均值，作为前端无有效坐标时的兜底
+        if attractions_with_coords:
+            center = (
+                sum(a["lng"] for a in attractions_with_coords) / len(attractions_with_coords),
+                sum(a["lat"] for a in attractions_with_coords) / len(attractions_with_coords),
+            )
+        else:
+            center = (base_lng, base_lat)
+
         result = {
             "attractions": attractions_with_coords,
             "routes": routes,
             "destination": state.get("destination", ""),
-            "center": (121.6186, 38.9146)
+            "center": center
         }
         print(f"✅ 地图数据生成完成: {len(result['attractions'])} 个景点, {len(result['routes'])} 段路线")
         return result

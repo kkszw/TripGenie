@@ -83,7 +83,7 @@
                       :day="day.day || index + 1"
                       :attractions="getDayAttractions(day.day || index + 1)"
                       :routes="getDayRoutes(day.day || index + 1)"
-                      :destination="plan.destination"
+                      :center="plan.map_data?.center"
                   />
 
                   <!-- 页码 -->

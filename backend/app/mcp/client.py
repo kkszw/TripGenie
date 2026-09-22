@@ -1,5 +1,6 @@
 # author: szw
-import asyncio
+import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, List
@@ -12,19 +13,30 @@ DISABLED_MCP_TOOLS = [
     "maps_weather",
 ]
 
+
+def resolve_uvx_path() -> str:
+    """定位 uvx 可执行文件：优先 .env 配置，其次 PATH，最后当前虚拟环境"""
+    if settings.uvx_path:
+        return settings.uvx_path
+
+    found = shutil.which("uvx")
+    if found:
+        return found
+
+    bin_dir = "Scripts" if os.name == "nt" else "bin"
+    executable = "uvx.exe" if os.name == "nt" else "uvx"
+    return str(Path(sys.executable).parent / bin_dir / executable)
+
+
 async def getAllClientTools():
     mcp_tools = []
-
-    # 修正：获取 Scripts 目录
-    venv_root = Path(sys.executable).parent  # D:\anaconda3\envs\AI私厨+智扫通客服
-    scripts_dir = venv_root / "Scripts"  # D:\anaconda3\envs\AI私厨+智扫通客服\Scripts
-    uvx_path = scripts_dir / "uvx.exe"  # D:\anaconda3\envs\AI私厨+智扫通客服\Scripts\uvx.exe
+    uvx_path = resolve_uvx_path()
 
     time_mcp_tool = MultiServerMCPClient(
         {
             "time": {
                 "transport": "stdio",
-                "command": str(uvx_path),
+                "command": uvx_path,
                 "args": [
                     "mcp-server-time",
                     "--local-timezone=Asia/Shanghai"
@@ -36,7 +48,7 @@ async def getAllClientTools():
         {
             "amap-mcp-server": {
                 "transport": "stdio",
-                "command": str(uvx_path),
+                "command": uvx_path,
                 "args": [
                     "amap-mcp-server"
                 ],

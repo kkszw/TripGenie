@@ -31,8 +31,12 @@ const props = defineProps({
   day: {type: Number, required: true},
   attractions: {type: Array, default: () => []},
   routes: {type: Array, default: () => []},
-  destination: {type: String, default: ''}
+  center: {type: Array, default: null}
 })
+
+const isValidCoord = (coord) =>
+    Array.isArray(coord) && coord.length >= 2 &&
+    Number.isFinite(Number(coord[0])) && Number.isFinite(Number(coord[1]))
 
 const mapId = computed(() => `day-map-${props.day}-${Math.random().toString(36).slice(2, 8)}`)
 let mapInstance = null
@@ -102,14 +106,22 @@ const initMap = (retryCount = 0) => {
 
       console.log(`📍 有效景点: ${validAttractions.length}/${props.attractions.length}`)
 
-      // 计算 center
-      let centerLng = 121.6186
-      let centerLat = 38.9146
+      // 计算 center：优先当日景点的包围盒中心，其次后端下发的城市中心
+      let centerLng = null
+      let centerLat = null
       if (validAttractions.length > 0) {
         const lngs = validAttractions.map(a => Number(a.lng))
         const lats = validAttractions.map(a => Number(a.lat))
         centerLng = (Math.min(...lngs) + Math.max(...lngs)) / 2
         centerLat = (Math.min(...lats) + Math.max(...lats)) / 2
+      } else if (isValidCoord(props.center)) {
+        centerLng = Number(props.center[0])
+        centerLat = Number(props.center[1])
+      }
+
+      if (centerLng === null || centerLat === null) {
+        console.warn('❌ 无可用坐标，跳过地图初始化')
+        return
       }
 
       // ✅ 创建地图
