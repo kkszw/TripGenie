@@ -1,0 +1,36 @@
+# ===== 环境变量与密钥 =====
+.env
+.env.*
+!.env.example
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 运行时状态库（每次对话都在变，不入库）=====
+checkpoints/
+
+# ===== 日志 =====
+*.log
+logs/
+
+# ===== 前端构建产物 =====
+dist/
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db
+
+# ===== Claude Code 本地权限配置 =====
+.claude/settings.local.json
