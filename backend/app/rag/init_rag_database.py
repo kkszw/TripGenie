@@ -1,19 +1,9 @@
 # author: szw
 # app/scripts/init_rag_db.py
-import sys
-import os
-from pathlib import Path
 from app.rag.embeddings import get_embeddings
 from app.rag.document_loader import *
 from app.rag.vector_store import add_documents, get_vector_store, get_collection_stats
-from app.config import settings
 from app.utils.path_tool import get_absolute_path
-
-import pdfplumber
-from docx import Document
-import pandas as pd
-from pptx import Presentation
-from PIL import Image
 
 
 def init_rag_database():
