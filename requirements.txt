@@ -1,0 +1,32 @@
+# TripGenie 后端依赖
+# 版本为作者本地已验证可运行的组合
+# 注意：Python 需 >= 3.12（app/core/agents.py 使用了 3.12 起才合法的 f-string 嵌套同类引号）
+
+# ---------- Web 框架 ----------
+fastapi==0.137.2
+uvicorn==0.49.0
+
+# ---------- 配置与数据校验 ----------
+pydantic==2.13.4
+pydantic-settings==2.14.1
+python-dotenv==1.2.2
+
+# ---------- Agent 编排 ----------
+langchain==1.3.10
+langchain-core==1.4.8
+langchain-community==0.4.2
+langgraph==1.2.6
+langchain-mcp-adapters==0.3.0
+
+# ---------- RAG ----------
+langchain-chroma==1.1.0
+langchain-text-splitters==1.1.2
+chromadb==1.5.9
+pypdf==6.13.3
+# docling 仅在 app/rag/document_loader.py 的 load_pdf_with_docling() 中使用，
+# 但该模块在 import 阶段就会加载它，因此属于必需依赖（包体较大）
+docling==2.118.0
+
+# ---------- 网络与存储 ----------
+httpx==0.28.1
+aiosqlite==0.22.1
