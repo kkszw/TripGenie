@@ -50,6 +50,11 @@ async def generate_sse_input(thread_id: str, message: str):
     """生成 SSE 流式响应 - 使用 astream_events 获取真正的流式输出"""
     workflow = await get_workflow()
 
+    # 图里真正的节点名。条件边的路由函数（intent_router / route_after_format）
+    # 在 astream_events 里同样会触发 on_chain_start/end，但它们不是节点，
+    # 漏进思考链就变成一行"正在执行 route_after_format..."的英文噪音。
+    node_names = set(workflow.get_graph().nodes) - {"__start__", "__end__"}
+
     # 返回 thread_id
     yield f"data: {json.dumps({'thread_id': thread_id})}\n\n"
 
@@ -84,6 +89,7 @@ async def generate_sse_input(thread_id: str, message: str):
         map_data_to_save = None
         has_trip_plan = False
         emitted_errors = set()  # 同一条 error 只推一次（节点返回整份 state，会重复出现）
+        clarify_sent = False  # clarify 只推一次（同上，整份 state 回传可能重入）
 
         # ✅ 使用 astream_events 获取真正的流式事件
         async for event in workflow.astream_events(
@@ -96,13 +102,18 @@ async def generate_sse_input(thread_id: str, message: str):
             # ✅ 处理 LLM 流式输出
             if kind == "on_chat_model_stream":
                 chunk = event["data"]["chunk"]
-                if chunk and hasattr(chunk, 'content') and chunk.content:
+                # 只有这两个节点的模型输出是给用户看的正文：
+                #   generate_plan —— 行程 JSON；chat —— 闲聊回复。
+                # format_input 这类节点内部也在调模型做结构化抽取，不过滤的话它吐的原始
+                # JSON 会被当成正文推给前端。行程场景下会被卡片盖住看不出来，但澄清场景
+                # 没有卡片覆盖，那段 {"destination": "", "days": null} 会直接留在界面上。
+                node = (event.get("metadata") or {}).get("langgraph_node")
+                if node in ("generate_plan", "chat") and chunk and hasattr(chunk, 'content') and chunk.content:
                     content = chunk.content
                     full_response += content
 
                     # ✅ 只把 generate_plan 节点的输出存到 save_content
-                    tags = event.get("tags", [])
-                    if "generate_plan" in tags:
+                    if node == "generate_plan":
                         save_content += content
 
                     yield f"data: {json.dumps({'type': 'chunk', 'content': content}, ensure_ascii=False)}\n\n"
@@ -110,13 +121,13 @@ async def generate_sse_input(thread_id: str, message: str):
             # ✅ 处理节点开始
             elif kind == "on_chain_start":
                 node_name = event.get("name", "unknown")
-                if node_name and node_name != "RunnableSequence":
+                if node_name in node_names:
                     yield f"data: {json.dumps({'type': 'node_start', 'node': node_name, 'message': f'正在执行 {node_name}...'}, ensure_ascii=False)}\n\n"
 
             # ✅ 处理节点结束
             elif kind == "on_chain_end":
                 node_name = event.get("name", "unknown")
-                if node_name and node_name != "RunnableSequence":
+                if node_name in node_names:
                     output = event["data"].get("output", {})
 
                     # 节点把失败写进 state 的错误键。之前三个并行检索节点的 except 只
@@ -130,6 +141,17 @@ async def generate_sse_input(thread_id: str, message: str):
                             if err and err not in emitted_errors:
                                 emitted_errors.add(err)
                                 yield f"data: {json.dumps({'type': 'warning', 'node': node_name, 'message': err}, ensure_ascii=False)}\n\n"
+
+                    # clarify 走的是模板话术，没有 LLM 调用，因此不会产生
+                    # on_chat_model_stream / chunk 事件。这里补发一条 message 事件，
+                    # 否则前端一个字都收不到；同时计入 full_response，
+                    # 否则下面 content_to_save 为空，这条追问不会落库、刷新就消失。
+                    if node_name == "clarify" and not clarify_sent and isinstance(output, dict):
+                        question = output.get("clarify_question") or output.get("response")
+                        if question:
+                            clarify_sent = True
+                            full_response += question
+                            yield f"data: {json.dumps({'type': 'message', 'content': question}, ensure_ascii=False)}\n\n"
 
                     # ✅ 只处理 generate_plan 节点
                     if node_name == "generate_plan" and not has_trip_plan:

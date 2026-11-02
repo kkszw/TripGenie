@@ -627,6 +627,7 @@ const handleSSEEvent = (data, aiMessage) => {
         'search_attractions': '🏛️ 搜索景点',
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
+        'clarify': '❓ 补充信息',
         'chat': '💬 思考回复'
       }
 
@@ -643,6 +644,7 @@ const handleSSEEvent = (data, aiMessage) => {
         'search_attractions': '🏛️ 搜索景点',
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
+        'clarify': '❓ 补充信息',
         'chat': '💬 思考回复'
       }
       const displayNodeEnd = nodeMapEnd[data.node] || data.node
@@ -763,6 +765,7 @@ const handleSSEEvent = (data, aiMessage) => {
         'search_attractions': '🏛️ 搜索景点',
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
+        'clarify': '❓ 补充信息',
         'chat': '💬 思考回复'
       }
       addThinkingStep(aiMessage, warnNodeMap[data.node] || data.node, data.message || '执行有异常', 'error')

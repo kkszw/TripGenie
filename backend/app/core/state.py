@@ -67,6 +67,12 @@ class TripState(TypedDict):
 
     # 流程控制 目前状态 错误情况 用户反馈
     current_step: str
+    # 关键槽位缺失时走 clarify 分支，不进入规划链路。
+    # 目前只拦 destination / days：缺目的地规划出来毫无意义，缺天数也没法排逐日行程；
+    # budget 缺了就用默认值，追问预算会让对话变成填表，体验更差。
+    missing_fields: List[str]
+    # clarify 节点要追问的话术（模板生成，不调 LLM）
+    clarify_question: Optional[str]
     # 顺序节点（format_input / generate_plan）的失败原因
     error: Optional[str]
     # 三个并行节点的失败原因必须各用一个键：它们在同一 superstep 里执行，

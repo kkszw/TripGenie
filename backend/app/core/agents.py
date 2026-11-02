@@ -130,17 +130,64 @@ async def intent_router(state: TripState) -> Literal["format_input", "chat"]:
     return state.get("current_step")
 
 
+def _as_number(value):
+    """把 LLM 返回的天数/预算宽松地转成数字，转不了就当没提供。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(str(value).strip().rstrip("天元块人民币")))
+        except (TypeError, ValueError):
+            return None
+
+
+def _detect_missing(state: TripState) -> List[str]:
+    """判断关键槽位是否缺失（destination / days）。
+
+    budget 不在此列：缺预算用默认值即可，追问预算会让对话变成填表。
+    """
+    missing: List[str] = []
+    if not (state.get("destination") or "").strip():
+        missing.append("destination")
+    if not state.get("days"):
+        missing.append("days")
+    return missing
+
+
 async def format_input(state: TripState, config: RunnableConfig = None) -> TripState:
-    """分析用户输入，提取目的地、天数、预算、偏好"""
+    """分析用户输入，提取目的地、天数、预算、偏好
+
+    多轮修改场景（先说"三亚3天"、再说"改成5天"）必须带上一轮的已知槽位：
+    LLM 只看本轮 user_input 时，"改成5天"里没有地名，destination 会解析成空；
+    如果直接覆盖 state，上一轮的三亚就丢了。所以这里既在 prompt 里喂已知值，
+    写回时也只覆盖"本轮明确提到"的字段。
+    """
+    known_dest = (state.get("destination") or "").strip()
+    known_days = state.get("days")
+    known_budget = state.get("budget")
+
     prompt = f"""
-        分析用户的旅行需求，提取关键信息：
-        用户输入：{state['user_input']}
-    
+        分析用户的旅行需求，提取关键信息。
+
+        已知信息（前几轮已确认，本轮没提到就沿用，不要自行编造）：
+        - 目的地：{known_dest or "未提供"}
+        - 天数：{known_days or "未提供"}
+        - 预算：{known_budget or "未提供"}
+
+        用户本轮输入：{state['user_input']}
+
+        规则：
+        1. 只输出用户本轮明确提到的字段；没提到的，destination 填空字符串、days 填 null、budget 填 null。
+        2. days 必须是用户明确说过的天数，没提就填 null，不要默认成 3。
+        3. destination 用 省名+市名，例如 辽宁省大连市。
+
         请只返回如下的JSON格式（不要加代码围栏）：
         {{
-            "destination": "目的地，没提到则填空字符串；提到则用 省名+市名，例如 辽宁省大连市",
-            "days": 3,
-            "budget": 5000,
+            "destination": "",
+            "days": null,
+            "budget": null,
             "preferences": ["偏好1", "偏好2"],
             "start_date": "{dt_date.today().isoformat()}"
         }}
@@ -160,15 +207,28 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
     try:
         print(f"📄 format_input 提取的 JSON: {content}")
         data = parse_llm_json(content)
-        state["destination"] = data.get("destination") or ""
-        state["days"] = data.get("days", 3)
-        state["budget"] = data.get("budget", 5000)
-        state["preferences"] = data.get("preferences", [])
+
+        # 只覆盖本轮明确提到的值：用户这轮说"改成5天"时，destination 不能因为
+        # LLM 返回空串就把上一轮的三亚清掉。
+        new_dest = (data.get("destination") or "").strip()
+        state["destination"] = new_dest or known_dest
+
+        new_days = _as_number(data.get("days"))
+        state["days"] = new_days if new_days else known_days
+
+        new_budget = _as_number(data.get("budget"))
+        state["budget"] = new_budget if new_budget else (known_budget or 5000)
+
+        state["preferences"] = data.get("preferences") or state.get("preferences") or []
         # 兼容旧字段名 start_data；缺失时保留调用方传入的 start_date（不要覆盖成 None）
         state["start_date"] = data.get("start_date") or data.get("start_data") or state.get("start_date")
     except Exception as e:
         state["error"] = "解析用户输入失败"
         print(f"format_input错误：{e}")
+
+    # 成功或失败都要算一次：解析挂了也得让 clarify 兜住，不能拿空目的地去检索
+    state["missing_fields"] = _detect_missing(state)
+    state["clarify_question"] = None
 
     # dest = state["destination"]
     # days = state["days"]
@@ -189,6 +249,52 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
     return state
 
 
+def _clarify_text(missing: List[str]) -> str:
+    """按缺失的槽位挑一句追问。
+
+    用模板而不是让 LLM 生成：追问场景只有三种，模板零延迟、零成本、措辞可控；
+    让 LLM 生成要多一次调用，还可能把待确认的信息说得更含糊。
+    """
+    has_dest = "destination" not in missing
+    has_days = "days" not in missing
+
+    if not has_dest and not has_days:
+        return "想去哪个城市？大概玩几天？还没定天数的话，我先按 3 天帮你排。"
+    if not has_dest:
+        return "想去哪个城市？"
+    return "打算玩几天？没说我就先按 3 天排，后面随时能改。"
+
+
+async def clarify(state: TripState) -> TripState:
+    """关键信息不全时不硬猜，先问清楚再规划。
+
+    只写 response / clarify_question，不动 destination 和 days：
+    用户这一轮的补充会在下一轮由 format_input 合并到已有槽位上
+    （已知值靠 checkpoint 带过去，前提是 format_input 不清空未提及的字段）。
+    """
+    missing = state.get("missing_fields") or []
+    question = _clarify_text(missing)
+
+    print(f"❓ clarify 追问：missing={missing} -> {question}")
+    state["clarify_question"] = question
+    state["response"] = question
+    state["current_step"] = "clarify"
+    # messages 带 add_messages reducer，这里是"追加一条"，不是覆盖历史
+    state["messages"] = [AIMessage(content=question)]
+    return state
+
+
+def route_after_format(state: TripState):
+    """format_input 之后的路由：缺关键槽位就短路到 clarify，否则并行扇出。
+
+    条件边返回 list 就是动态 fan-out，和原来三条静态 add_edge 等价，
+    只是多了一个"不满足条件时改走 clarify"的分支。
+    """
+    if state.get("missing_fields"):
+        return ["clarify"]
+    return ["retrieve_guides", "search_attractions", "get_weather"]
+
+
 async def retrieve_guides(state: TripState, config: RunnableConfig = None):
     """从攻略库检索相关文档（RAG）"""
     writer = config.get("configurable", {}).get("writer") if config else None
@@ -199,7 +305,8 @@ async def retrieve_guides(state: TripState, config: RunnableConfig = None):
             "message": "正在搜索相关旅游攻略..."
         })
     try:
-        query = f"去{state['destination']}玩{state['days']}天，预算{state.get('budget')},喜欢{' '.join(state.get('preferences'))}"
+        # days 现在允许为 None（表示用户没说，会先被 clarify 拦住），这里兜一次底
+        query = f"去{state['destination']}玩{state.get('days') or 3}天，预算{state.get('budget')},喜欢{' '.join(state.get('preferences'))}"
         # retrieve_context 内部是同步的 embedding HTTP 调用，直接跑会阻塞事件循环
         # （SSE 心跳、其它请求一起卡住），丢到线程池里执行。
         # 只取已格式化的 context 文本：原来把 List[Document] 直接塞进 prompt，
@@ -345,7 +452,7 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
     你是一个专业的旅行规划师。根据以下信息生成行程：
 
     目的地：{state.get('destination', '未知')}
-    天数：{state.get('days', 3)} 天
+    天数：{state.get('days') or 3} 天
     预算：{state.get('budget', 5000)} 元
     偏好：{', '.join(state.get('preferences', []))}
     天气：{state.get('weather_info', '未知')}

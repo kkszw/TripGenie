@@ -19,6 +19,7 @@ async def create_workflow():
     workflow.add_node("chat", chat)
     workflow.add_node("tool_node", tool_node)
     workflow.add_node("format_input", format_input)
+    workflow.add_node("clarify", clarify)
     workflow.add_node("get_weather", get_weather_node)
     workflow.add_node("retrieve_guides", retrieve_guides)
     workflow.add_node("search_attractions", search_attractions_node)
@@ -31,9 +32,11 @@ async def create_workflow():
     workflow.add_conditional_edges("chat", should_continue)
     workflow.add_edge("tool_node", END)
 
-    workflow.add_edge("format_input", "retrieve_guides")
-    workflow.add_edge("format_input", "search_attractions")
-    workflow.add_edge("format_input", "get_weather")
+    # format_input 之后先判断槽位是否齐全：缺目的地/天数就短路到 clarify，
+    # 齐全才并行扇出三个检索节点。条件边返回 list 即为动态 fan-out，
+    # 与原来三条静态 add_edge 等价，只是多了一条"先问清楚"的分支。
+    workflow.add_conditional_edges("format_input", route_after_format)
+    workflow.add_edge("clarify", END)
 
     workflow.add_edge("retrieve_guides", "generate_plan")
     workflow.add_edge("search_attractions", "generate_plan")
