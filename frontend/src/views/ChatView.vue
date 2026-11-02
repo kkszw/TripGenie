@@ -1028,8 +1028,12 @@ const parseTripPlanFromMessage = (content) => {
     let jsonMatch = content.match(/```json\s*([\s\S]*?)\s*```/)
     if (jsonMatch) {
       try {
-        const data = JSON.parse(jsonMatch[1])
-        return convertToTripPlan(data)
+        // 注意：命中的代码块不一定就是行程。generate_plan 的正文里可能跟了第二段
+        // JSON（景点提取结果 {"attractions": [...]}），这时 convertToTripPlan 返回
+        // null，必须继续尝试后面的格式，不能直接 return 出去——否则整条消息退化成
+        // 显示原始 JSON（历史消息最明显）。
+        const plan = convertToTripPlan(JSON.parse(jsonMatch[1]))
+        if (plan) return plan
       } catch (e) {
         console.warn('⚠️ JSON 代码块解析失败:', e)
       }
@@ -1039,8 +1043,8 @@ const parseTripPlanFromMessage = (content) => {
     jsonMatch = content.match(/```\s*([\s\S]*?)\s*```/)
     if (jsonMatch) {
       try {
-        const data = JSON.parse(jsonMatch[1])
-        return convertToTripPlan(data)
+        const plan = convertToTripPlan(JSON.parse(jsonMatch[1]))
+        if (plan) return plan
       } catch (e) {
         // 不是 JSON，忽略
       }
@@ -1088,8 +1092,8 @@ const parseTripPlanFromMessage = (content) => {
       if (endIndex > startIndex) {
         const jsonStr = content.substring(startIndex, endIndex)
         try {
-          const data = JSON.parse(jsonStr)
-          return convertToTripPlan(data)
+          const plan = convertToTripPlan(JSON.parse(jsonStr))
+          if (plan) return plan
         } catch (e) {
           // 忽略解析失败
         }

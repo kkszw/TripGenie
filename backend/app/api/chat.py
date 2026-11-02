@@ -55,6 +55,14 @@ async def generate_sse_input(thread_id: str, message: str):
     # 漏进思考链就变成一行"正在执行 route_after_format..."的英文噪音。
     node_names = set(workflow.get_graph().nodes) - {"__start__", "__end__"}
 
+    # 正文判定：按"这一次调用的 token 是不是给用户看的"来判，而不是按节点名。
+    # 节点内部的辅助调用（景点提取、结构化抽取）事件同样归属该节点名，靠节点名
+    # 过滤必然漏——之前景点提取的 {"attractions": [...]} 就是这么漏进正文并落库的。
+    # 现在两层：
+    #   1. 生成侧给面向用户的调用打 user_visible，给内部调用打 internal；
+    #   2. 保留旧的节点名白名单作兼容（还没打标记的老代码不会突然丢正文）。
+    LEGACY_TEXT_NODES = ("generate_plan", "chat")
+
     # 返回 thread_id
     yield f"data: {json.dumps({'thread_id': thread_id})}\n\n"
 
@@ -108,7 +116,11 @@ async def generate_sse_input(thread_id: str, message: str):
                 # JSON 会被当成正文推给前端。行程场景下会被卡片盖住看不出来，但澄清场景
                 # 没有卡片覆盖，那段 {"destination": "", "days": null} 会直接留在界面上。
                 node = (event.get("metadata") or {}).get("langgraph_node")
-                if node in ("generate_plan", "chat") and chunk and hasattr(chunk, 'content') and chunk.content:
+                tags = set(event.get("tags") or [])
+                is_visible = "internal" not in tags and (
+                    "user_visible" in tags or node in LEGACY_TEXT_NODES
+                )
+                if is_visible and chunk and hasattr(chunk, 'content') and chunk.content:
                     content = chunk.content
                     full_response += content
 

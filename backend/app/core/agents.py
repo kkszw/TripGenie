@@ -33,6 +33,21 @@ llm = ChatOpenAI(
     max_retries=2,
     extra_body={"thinking": {"type": settings.deepseek_thinking}},
 )
+# 内部结构化抽取专用的模型实例：必须关掉 streaming。
+# streaming=True 的 llm 在 ainvoke 时同样会逐块生成并触发 on_chat_model_stream，
+# 而景点提取是在 generate_plan 节点内部被调用的，事件 metadata.langgraph_node 就是
+# generate_plan —— 于是这段"只给程序看的 JSON"被 api/chat.py 当成正文推给前端，
+# 还写进了 messages.content。表现就是行程 JSON 后面又跟一段 {"attractions": [...]}，
+# 前端解析到第二段渲染不出卡片，整条消息退化成原始 JSON 文本。
+llm_extract = ChatOpenAI(
+    model=settings.deepseek_model,
+    api_key=settings.deepseek_api_key,
+    base_url=settings.deepseek_base_url,
+    streaming=False,
+    timeout=settings.llm_timeout,
+    max_retries=2,
+    extra_body={"thinking": {"type": settings.deepseek_thinking}},
+)
 # DeepSeek 不支持 response_format={"type":"json_schema"}（langchain 对 pydantic 模型的默认做法），
 # 直接调用会 400: "This response_format type is unavailable now"。
 # 改走 function_calling，把 schema 作为 tool 定义下发——DeepSeek 官方支持 tool calls。
@@ -143,14 +158,35 @@ def _as_number(value):
             return None
 
 
-def _detect_missing(state: TripState) -> List[str]:
+# 用户明确表示"不要之前那个城市"的说法。这类话里没有地名，LLM 抽不出 destination，
+# 但如果上一步正在沿用历史目的地，就会变成"用户想换、系统还按老城市排"。
+_CHANGE_CITY_HINTS = ("换城市", "换个城市", "别的城市", "其他城市", "其它城市",
+                      "另一个城市", "换地方", "换个地方", "不想去")
+
+
+def _wants_other_city(text: str) -> bool:
+    text = text or ""
+    return any(hint in text for hint in _CHANGE_CITY_HINTS)
+
+
+def _detect_missing(state: TripState, dest_explicit: bool = True,
+                    inherit_dest: bool = True) -> List[str]:
     """判断关键槽位是否缺失（destination / days）。
 
     budget 不在此列：缺预算用默认值即可，追问预算会让对话变成填表。
+
+    历史目的地能不能直接沿用，取决于"这句话是不是在接着上一份行程说"：
+    - inherit_dest=True：在补全追问（"3天""对"）或修改行程（"改成5天"），沿用是对的；
+    - inherit_dest=False：隔了几轮又说"帮我规划个旅行"，checkpoint 里的目的地
+      早就过时了，直接沿用会变成"默默规划一个用户没提的城市"
+      （实测把上一轮的大连又排了一遍），所以退化成确认式追问。
     """
     missing: List[str] = []
-    if not (state.get("destination") or "").strip():
+    dest = (state.get("destination") or "").strip()
+    if not dest:
         missing.append("destination")
+    elif not dest_explicit and not inherit_dest:
+        missing.append("confirm_destination")
     if not state.get("days"):
         missing.append("days")
     return missing
@@ -168,6 +204,11 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
     known_days = state.get("days")
     known_budget = state.get("budget")
 
+    # 上一轮是不是 clarify 追问（clarify 节点会把问题写进 clarify_question，
+    # 这里读完就清空，等价于"消费一次"）。只有处在这条补全链上，
+    # 才允许把 checkpoint 里的老槽位直接拿来用。
+    continuing_clarify = bool((state.get("clarify_question") or "").strip())
+
     prompt = f"""
         分析用户的旅行需求，提取关键信息。
 
@@ -182,9 +223,14 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
         1. 只输出用户本轮明确提到的字段；没提到的，destination 填空字符串、days 填 null、budget 填 null。
         2. days 必须是用户明确说过的天数，没提就填 null，不要默认成 3。
         3. destination 用 省名+市名，例如 辽宁省大连市。
+        4. task_type 判断本轮和上一份行程的关系：
+           - "modify"：在改/补充刚才的行程，包括"改成5天""换成便宜点的""对""3天"这类回答；
+           - "new"：重新提出一次规划请求，例如"帮我规划个旅行""再给我排一版别的"。
+           如果输入里没有任何指向上文行程的线索，一律填 "new"。
 
         请只返回如下的JSON格式（不要加代码围栏）：
         {{
+            "task_type": "new",
             "destination": "",
             "days": null,
             "budget": null,
@@ -204,13 +250,17 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
     if isinstance(content, list):
         # 如果是列表，拼接成字符串
         content = " ".join(str(item) for item in content)
+    dest_explicit = False   # 本轮输入里是否真的出现了目的地
+    modifying = False       # 本轮是在修改上一份行程 / 回答追问，而不是开新任务
     try:
         print(f"📄 format_input 提取的 JSON: {content}")
         data = parse_llm_json(content)
+        modifying = str(data.get("task_type") or "").strip().lower() == "modify"
 
         # 只覆盖本轮明确提到的值：用户这轮说"改成5天"时，destination 不能因为
         # LLM 返回空串就把上一轮的三亚清掉。
         new_dest = (data.get("destination") or "").strip()
+        dest_explicit = bool(new_dest)
         state["destination"] = new_dest or known_dest
 
         new_days = _as_number(data.get("days"))
@@ -226,8 +276,19 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
         state["error"] = "解析用户输入失败"
         print(f"format_input错误：{e}")
 
+    # 用户说"换个城市"却没点名：不能顺着老目的地继续排，清掉让它变成真正的追问
+    if not dest_explicit and _wants_other_city(state.get("user_input")):
+        state["destination"] = ""
+
     # 成功或失败都要算一次：解析挂了也得让 clarify 兜住，不能拿空目的地去检索
-    state["missing_fields"] = _detect_missing(state)
+    state["missing_fields"] = _detect_missing(
+        state,
+        dest_explicit=dest_explicit,
+        # 两种情况才允许沿用 checkpoint 里的老目的地：
+        #   1) 上一轮就是 clarify 追问，用户在补全（"3天""对"）
+        #   2) LLM 判定本轮是在改上一份行程（"改成5天""换成便宜点的"）
+        inherit_dest=continuing_clarify or modifying,
+    )
     state["clarify_question"] = None
 
     # dest = state["destination"]
@@ -249,12 +310,23 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
     return state
 
 
-def _clarify_text(missing: List[str]) -> str:
+def _clarify_text(missing: List[str], state: Optional[TripState] = None) -> str:
     """按缺失的槽位挑一句追问。
 
-    用模板而不是让 LLM 生成：追问场景只有三种，模板零延迟、零成本、措辞可控；
+    用模板而不是让 LLM 生成：追问场景只有这几种，模板零延迟、零成本、措辞可控；
     让 LLM 生成要多一次调用，还可能把待确认的信息说得更含糊。
     """
+    state = state or {}
+
+    # 情况 0：历史里有目的地，但本轮没提、也不是在补全追问
+    # -> 不是"缺信息"，而是"要不要沿用"，措辞要把老答案摆出来让用户确认
+    if "confirm_destination" in missing:
+        dest = (state.get("destination") or "").strip()
+        days = state.get("days")
+        suffix = f"（{days} 天）" if days else ""
+        return (f"上次规划的是 {dest}{suffix}，这次还是按它来吗？"
+                f"想换城市或改天数，直接告诉我。")
+
     has_dest = "destination" not in missing
     has_days = "days" not in missing
 
@@ -273,7 +345,7 @@ async def clarify(state: TripState) -> TripState:
     （已知值靠 checkpoint 带过去，前提是 format_input 不清空未提及的字段）。
     """
     missing = state.get("missing_fields") or []
-    question = _clarify_text(missing)
+    question = _clarify_text(missing, state)
 
     print(f"❓ clarify 追问：missing={missing} -> {question}")
     state["clarify_question"] = question
@@ -479,7 +551,10 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
     full_response = ""
     runnable_config: RunnableConfig = {
         "configurable": {"thread_id": state.get("thread_id")},
-        "tags": ["generate_plan"]  # ← 打上标记
+        # user_visible：这一次调用的 token 是给用户看的正文。
+        # api/chat.py 只按这个标记推流，而不再是"节点名等于 generate_plan"——
+        # 节点内部任何辅助调用都归属同一节点名，靠节点名过滤必然漏（景点提取就漏过）。
+        "tags": ["user_visible"],
     }
     # 使用 astream 流式生成
     async for chunk in llm.astream([HumanMessage(content=prompt)], config=runnable_config):
@@ -574,7 +649,13 @@ async def extract_attractions_with_llm(state: TripState, plan_data: dict) -> Lis
 
     try:
         print("🤖 使用 LLM 提取景点...")
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        # 用 llm_extract（streaming=False）：这里的输出是给程序看的中转数据，
+        # 不能进 SSE 正文，否则会跟在行程 JSON 后面一起推给前端。
+        # internal 是第二道保险：万一以后有人图省事又改回 llm，api/chat.py 看到
+        # 这个标记也会跳过，不会再漏进正文。
+        response = await llm_extract.ainvoke(
+            [HumanMessage(content=prompt)], config={"tags": ["internal"]}
+        )
         content = response.content
 
         print(f"LLM 响应: {content[:20]}...")
@@ -1311,7 +1392,12 @@ async def chat(state: TripState, config: RunnableConfig = None):
             "message": "正在生成回复..."
         })
     full_response = None
-    config: RunnableConfig = {"configurable": {"thread_id": state.get("thread_id")}}
+    # user_visible 同 generate_plan：这一次调用的 token 是给用户看的正文。
+    # 注意这里是重新赋值 config，会把函数参数里可能带的 tags 丢掉，所以必须显式写。
+    config: RunnableConfig = {
+        "configurable": {"thread_id": state.get("thread_id")},
+        "tags": ["user_visible"],
+    }
     async for chunk in model_with_tools.astream(messages, config=config):
 
         if full_response is None:
@@ -1388,8 +1474,11 @@ async def tool_node(state: TripState):
     all_messages = state.get("messages", []) + results
 
     try:
-        # 调用 LLM 生成最终回复（不带工具）
-        final_response = await llm.ainvoke(all_messages)
+        # 调用 LLM 生成最终回复（不带工具）。这条是用户真正看到的正文，
+        # 同样要打 user_visible——否则走工具的那一轮，最终回复会被 chat.py 过滤掉。
+        final_response = await llm.ainvoke(
+            all_messages, config={"tags": ["user_visible"]}
+        )
         final_content = final_response.content if hasattr(final_response, 'content') else str(final_response)
 
         print(f"📝 最终回复: {final_content[:100]}...")
