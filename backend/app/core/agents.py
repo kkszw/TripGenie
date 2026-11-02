@@ -858,46 +858,43 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
         # 3. 规划路线（如果有多个景点）
         routes = []
         if len(attractions_with_coords) >= 2:
-            driving_tool = tools_by_name.get("maps_direction_driving_by_coordinates")
-            if driving_tool:
-                for i in range(len(attractions_with_coords) - 1):
-                    origin = attractions_with_coords[i]
-                    dest = attractions_with_coords[i + 1]
+            for i in range(len(attractions_with_coords) - 1):
+                origin = attractions_with_coords[i]
+                dest = attractions_with_coords[i + 1]
 
-                    # ✅ 关键：只在同一天内生成路线，跳过跨天
-                    origin_day = origin.get("day", 1)
-                    dest_day = dest.get("day", 1)
-                    if origin_day != dest_day:
-                        print(f"⏭️ 跳过跨天路线: {origin['name']}(Day{origin_day}) → {dest['name']}(Day{dest_day})")
-                        continue
+                # ✅ 关键：只在同一天内生成路线，跳过跨天
+                origin_day = origin.get("day", 1)
+                dest_day = dest.get("day", 1)
+                if origin_day != dest_day:
+                    print(f"⏭️ 跳过跨天路线: {origin['name']}(Day{origin_day}) → {dest['name']}(Day{dest_day})")
+                    continue
 
-                    try:
-                        print(f"🚗 规划路线: {origin['name']} → {dest['name']}")
-                        result = await driving_tool.ainvoke({
-                            "origin": f"{origin['lng']},{origin['lat']}",
-                            "destination": f"{dest['lng']},{dest['lat']}"
-                        })
-                        route_info = parse_route_result(result)
-                        routes.append({
-                            "from": origin["name"],
-                            "to": dest["name"],
-                            "from_coord": [origin["lng"], origin["lat"]],
-                            "to_coord": [dest["lng"], dest["lat"]],
-                            "distance": route_info.get("distance", 0),
-                            "duration": route_info.get("duration", 0),
-                            "polyline": route_info.get("polyline", [])
-                        })
-                        print(f"  ✅ 路线规划完成")
-                    except Exception as e:
-                        print(f"路线规划失败: {e}")
-                        routes.append({
-                            "from": origin["name"],
-                            "to": dest["name"],
-                            "from_coord": [origin["lng"], origin["lat"]],
-                            "to_coord": [dest["lng"], dest["lat"]],
-                            "distance": 0,
-                            "duration": 0
-                        })
+                try:
+                    print(f"🚗 规划路线: {origin['name']} → {dest['name']}")
+                    route_info = await plan_driving_route(origin, dest)
+                    routes.append({
+                        "from": origin["name"],
+                        "to": dest["name"],
+                        "from_coord": [origin["lng"], origin["lat"]],
+                        "to_coord": [dest["lng"], dest["lat"]],
+                        "distance": route_info.get("distance", 0),
+                        "duration": route_info.get("duration", 0),
+                        "polyline": route_info.get("polyline", [])
+                    })
+                    print(f"  ✅ 路线规划完成: {route_info.get('distance', 0)}m / "
+                          f"{route_info.get('duration', 0)}s / "
+                          f"折线 {len(route_info.get('polyline') or [])} 点")
+                except Exception as e:
+                    print(f"路线规划失败: {e}")
+                    routes.append({
+                        "from": origin["name"],
+                        "to": dest["name"],
+                        "from_coord": [origin["lng"], origin["lat"]],
+                        "to_coord": [dest["lng"], dest["lat"]],
+                        "distance": 0,
+                        "duration": 0,
+                        "polyline": []
+                    })
 
         existing_names = {a["name"] for a in attractions_with_coords}
 
@@ -941,22 +938,210 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
         return {}
 
 
-def parse_route_result(result: Any) -> Dict:
-    """解析路线结果"""
+def _unwrap_mcp_result(result: Any) -> Optional[Dict]:
+    """把 MCP 工具的返回值还原成 dict。
+
+    langchain-mcp-adapters 不会把工具返回的 dict 原样交出来，而是序列化成
+    ``[{'type': 'text', 'text': '{"route": ...}'}]``（多个内容块就是多个元素）；
+    这里同时兼容：直接 dict、JSON 字符串、ToolMessage（带 .content）。
+    """
+    if result is None:
+        return None
+    if isinstance(result, dict):
+        return result
+    # ToolMessage 之类的消息对象：取 content 继续往下走
+    if not isinstance(result, (list, tuple, str, bytes)) and hasattr(result, "content"):
+        result = result.content
+    if isinstance(result, bytes):
+        result = result.decode("utf-8", "ignore")
+    if isinstance(result, (list, tuple)):
+        texts: List[str] = []
+        structured: List[Dict] = []
+        for item in result:
+            if isinstance(item, str):
+                texts.append(item)
+            elif isinstance(item, dict):
+                if "text" in item and item.get("type") in (None, "text"):
+                    texts.append(str(item.get("text") or ""))
+                else:
+                    structured.append(item)   # 本身就已经是结构化 payload
+        if texts:
+            result = "".join(texts)
+        elif len(structured) == 1:
+            return structured[0]
+        else:
+            return None
+    if isinstance(result, str):
+        try:
+            parsed = json.loads(result)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
+
+
+def _parse_polyline(raw: Any) -> List[List[float]]:
+    """把高德折线转成前端要的 [[lng, lat], ...]。
+
+    高德 v3 驾车接口的折线在 ``paths[0]["path"]`` 里，形如 "116.1,39.1;116.2,39.2"，
+    **没有** ``polyline`` 字段。老代码取的是 path.get("polyline")，永远拿不到，
+    于是静默变成 []，前端只能退化成起终点之间的一条虚线（看起来"只有点没有路线"）。
+    这里同时兼容字符串、已解析的数组、以及 step 级别的 polyline 片段。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        points: List[List[float]] = []
+        for pair in raw.split(";"):
+            parts = pair.strip().split(",")
+            if len(parts) < 2:
+                continue
+            try:
+                lng, lat = float(parts[0]), float(parts[1])
+            except (TypeError, ValueError):
+                continue
+            if -180.0 <= lng <= 180.0 and -90.0 <= lat <= 90.0:
+                points.append([round(lng, 6), round(lat, 6)])
+        return points
+    if isinstance(raw, (list, tuple)):
+        points = []
+        for item in raw:
+            if isinstance(item, str):
+                points.extend(_parse_polyline(item))
+            elif isinstance(item, (list, tuple)) and len(item) >= 2:
+                try:
+                    lng, lat = float(item[0]), float(item[1])
+                except (TypeError, ValueError):
+                    continue
+                if -180.0 <= lng <= 180.0 and -90.0 <= lat <= 90.0:
+                    points.append([round(lng, 6), round(lat, 6)])
+        return points
+    return []
+
+
+AMAP_DRIVING_URL = "https://restapi.amap.com/v3/direction/driving"
+
+
+async def _driving_route_rest(origin: Dict, dest: Dict) -> Optional[Dict]:
+    """高德 Web 服务 REST 驾车路径规划（**带完整折线**）
+
+    为什么不直接用 MCP 的 maps_direction_driving_by_coordinates：
+    那个包把 steps 精简成 instruction/road/distance 几个字段，把折线 `polyline` 丢了，
+    path 级又只有 distance/duration —— 于是前端永远拿不到 polyline，
+    只能退化成起终点之间的一条虚线（看起来"地图上只有点、没有路线"）。
+    REST 直连一次 HTTP 约 50~150ms，比拉 MCP 子进程还快。
+    """
+    key = getattr(settings, "amap_api_key", None)
+    if not key:
+        return None
+
     try:
-        if isinstance(result, dict):
-            route = result.get("route", {})
-            paths = route.get("paths", [])
-            if paths:
-                path = paths[0]
-                return {
-                    "distance": path.get("distance", 0),
-                    "duration": path.get("duration", 0),
-                    "polyline": path.get("polyline", [])
-                }
-    except:
-        pass
-    return {"distance": 0, "duration": 0, "polyline": []}
+        params = {
+            "key": key,
+            "origin": f"{float(origin['lng']):.6f},{float(origin['lat']):.6f}",
+            "destination": f"{float(dest['lng']):.6f},{float(dest['lat']):.6f}",
+            "extensions": "base",
+        }
+    except (KeyError, TypeError, ValueError):
+        return None
+
+    # 高德对并发有 QPS 限制（个人 Key 很低），连续请求会回 10021，
+    # 所以这里遇到 QPS 超限退避重试几次，别直接把这条路线丢掉。
+    data: Dict = {}
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(AMAP_DRIVING_URL, params=params)
+                data = resp.json()
+        except Exception as e:
+            print(f"  ⚠️ 驾车路线 REST 请求失败: {e}")
+            data = {}
+        if str(data.get("status")) == "1":
+            break
+        if str(data.get("infocode")) == "10021" and attempt < 2:
+            await asyncio.sleep(0.5 * (attempt + 1))
+            continue
+        print(f"  ⚠️ 驾车路线 REST 返回异常: {data.get('info')} ({data.get('infocode')})")
+        return None
+
+    if str(data.get("status")) != "1":
+        return None
+
+    # extensions=base 时 steps 里也带 polyline；parse_route_result 会按顺序拼起来
+    return parse_route_result(data)
+
+
+async def plan_driving_route(origin: Dict, dest: Dict) -> Dict:
+    """一段驾车路线：REST 优先（有折线），失败再退回 MCP（只有距离/时长）。"""
+    info = await _driving_route_rest(origin, dest)
+    if info and info.get("polyline"):
+        return info
+
+    driving_tool = tools_by_name.get("maps_direction_driving_by_coordinates")
+    if driving_tool:
+        try:
+            result = await driving_tool.ainvoke({
+                "origin": f"{origin['lng']},{origin['lat']}",
+                "destination": f"{dest['lng']},{dest['lat']}"
+            })
+            mcp_info = parse_route_result(result)
+            # MCP 只补距离/时长；折线还是以 REST 的为准（MCP 那份是空的）
+            if mcp_info.get("distance") or mcp_info.get("duration"):
+                if not info:
+                    return mcp_info
+                info["distance"] = info.get("distance") or mcp_info["distance"]
+                info["duration"] = info.get("duration") or mcp_info["duration"]
+        except Exception as e:
+            print(f"  ⚠️ MCP 备用路线也失败: {e}")
+
+    return info or {"distance": 0, "duration": 0, "polyline": []}
+
+
+def parse_route_result(result: Any) -> Dict:
+    """解析高德驾车路径规划结果。
+
+    统一输出 {"distance": 米, "duration": 秒, "polyline": [[lng, lat], ...]}。
+    解析不出来时**打印原因**，不再静默返回 0 / 空折线 —— 之前就是这样
+    既看不到路线，日志还写着"路线规划完成"。
+    """
+    empty = {"distance": 0, "duration": 0, "polyline": []}
+    payload = _unwrap_mcp_result(result)
+    if not isinstance(payload, dict):
+        print(f"  ⚠️ 路线结果无法解析（{type(result).__name__}）: {str(result)[:200]}")
+        return empty
+    if payload.get("error"):
+        print(f"  ⚠️ 路线接口报错: {payload['error']}")
+        return empty
+
+    route = payload.get("route") if isinstance(payload.get("route"), dict) else payload
+    paths = route.get("paths") or []
+    if not paths and ("path" in route or "distance" in route):
+        paths = [route]
+    if not paths:
+        print(f"  ⚠️ 路线结果里没有 paths，字段: {list(payload)[:8]}")
+        return empty
+
+    path = paths[0]
+    distance = _as_number(path.get("distance")) or 0
+    duration = _as_number(path.get("duration")) or 0
+    polyline = _parse_polyline(path.get("path") or path.get("polyline"))
+
+    # 折线主要来源：steps[].polyline（高德 v3 驾车实测就只有这里），首尾相接拼起来
+    if not polyline:
+        chunks = [
+            step.get("polyline") or step.get("path") or ""
+            for step in (path.get("steps") or [])
+            if isinstance(step, dict)
+        ]
+        joined = _parse_polyline(";".join(c for c in chunks if isinstance(c, str)))
+        # 相邻路段首尾点会重复，去一下重（否则前端折线有几段会多出一个重复点）
+        for point in joined:
+            if not polyline or polyline[-1] != point:
+                polyline.append(point)
+
+    if not polyline:
+        print(f"  ⚠️ 拿到距离 {distance}m 但没有折线，可用字段: {list(path)[:8]}")
+    return {"distance": distance, "duration": duration, "polyline": polyline}
 
 
 # 高德地理编码结果里的"行政区级" level 取值。这类结果的 location 是城市/区县中心点，
