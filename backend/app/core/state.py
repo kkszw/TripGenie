@@ -81,6 +81,20 @@ class TripState(TypedDict):
     need_confirm: NotRequired[bool]
     # confirmed：confirm_needs 的结论。False 表示用户在确认卡上点了"算了"。
     confirmed: NotRequired[bool]
+
+    # ===== 自我反思：生成 → 质检 →（不过则带 feedback 重排一次）=====
+    # review_passed：评审是否放行。True 才会去生成地图并推给前端。
+    review_passed: NotRequired[bool]
+    # review_issues：具体毛病，给用户/日志看（"天数不对""预算超了"）。
+    review_issues: NotRequired[List[str]]
+    # review_feedback：给规划师看的具体修改指令，重排时拼进 prompt。
+    review_feedback: NotRequired[str]
+    # review_round：已经重排过几次。到上限就不再回环，避免无限"写-批-改"。
+    review_round: NotRequired[int]
+    # plan_tips：行程 JSON 里的 tips，落库/推送 trip_plan 时要带上
+    plan_tips: NotRequired[List[str]]
+    # review_error：质检自己挂了（LLM 超时/解析失败）。只告警，不阻断行程
+    review_error: Optional[str]
     # 顺序节点（format_input / generate_plan）的失败原因
     error: Optional[str]
     # 三个并行节点的失败原因必须各用一个键：它们在同一 superstep 里执行，

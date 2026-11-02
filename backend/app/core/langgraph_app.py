@@ -27,6 +27,9 @@ async def create_workflow():
     workflow.add_node("retrieve_guides", retrieve_guides)
     workflow.add_node("search_attractions", search_attractions_node)
     workflow.add_node("generate_plan", generate_plan_node)
+    # 地图单独成节点：质检可能把 generate_plan 打回重排，地图只该出一次
+    workflow.add_node("review_plan", review_plan_node)
+    workflow.add_node("generate_map", generate_map_node)
 
     # 定义边（并行执行）
     workflow.add_edge(START, "classify_input")
@@ -49,7 +52,12 @@ async def create_workflow():
     workflow.add_edge("retrieve_guides", "generate_plan")
     workflow.add_edge("search_attractions", "generate_plan")
     workflow.add_edge("get_weather", "generate_plan")
-    workflow.add_edge("generate_plan", END)
+
+    # 生成 → 质检 →（不过则带着 feedback 回 generate_plan，最多一轮）→ 出地图
+    # 自环用的是条件边：route_after_review 返回 ["generate_plan"] 就是回到上游重跑。
+    workflow.add_edge("generate_plan", "review_plan")
+    workflow.add_conditional_edges("review_plan", route_after_review)
+    workflow.add_edge("generate_map", END)
 
     # 编译（带检查点）
     check = await get_checkpointer()

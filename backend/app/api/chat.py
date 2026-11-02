@@ -219,7 +219,8 @@ async def _run_stream(thread_id: str,
                     # 拿到一份"少了攻略/地图"的行程，不知道哪里失败了。
                     # 这里转成 warning 事件：前端在思考链里把该节点标红，但不打断正文。
                     if isinstance(output, dict):
-                        for key in ("error", "guides_error", "attractions_error", "weather_error"):
+                        for key in ("error", "guides_error", "attractions_error",
+                                    "weather_error", "review_error"):
                             err = output.get(key)
                             if err and err not in emitted_errors:
                                 emitted_errors.add(err)
@@ -236,13 +237,23 @@ async def _run_stream(thread_id: str,
                             full_response += text
                             yield f"data: {json.dumps({'type': 'message', 'content': text}, ensure_ascii=False)}\n\n"
 
-                    # ✅ 只处理 generate_plan 节点
-                    if node_name == "generate_plan" and not has_trip_plan:
+                    # 质检没过、准备带着 feedback 重排：让前端把上一版正文清掉。
+                    # 第二版的 token 走的是同一个流，不清就会在气泡里拼成两份行程；
+                    # 服务端这两个累加器也要一起归零，否则落库内容是"坏的一版 + 好的一版"。
+                    if (node_name == "review_plan" and isinstance(output, dict)
+                            and not output.get("review_passed")):
+                        issues = output.get("review_issues") or []
+                        full_response = ""
+                        save_content = ""
+                        yield f"data: {json.dumps({'type': 'review', 'issues': issues, 'message': '；'.join(issues) or '行程与你的要求有出入'}, ensure_ascii=False)}\n\n"
+
+                    # ✅ 行程卡片 + 地图：都在 generate_map 收口（地图只这一次）
+                    if node_name == "generate_map" and not has_trip_plan:
                         if isinstance(output, dict):
                             draft_plan = output.get("draft_plan")
                             map_data = output.get("map_data")
 
-                            print(f"🔍 generate_plan 完成: draft_plan={bool(draft_plan)}, map_data={bool(map_data)}")
+                            print(f"🔍 generate_map 完成: draft_plan={bool(draft_plan)}, map_data={bool(map_data)}")
                             if map_data:
                                 print(f"🔍 map_data.attractions 数量: {len(map_data.get('attractions', []))}")
 
@@ -256,7 +267,7 @@ async def _run_stream(thread_id: str,
                                     "destination": output.get("destination", ""),
                                     "totalDays": len(draft_plan),
                                     "budget": output.get("budget", 0),
-                                    "tips": output.get("tips", [])
+                                    "tips": output.get("plan_tips", [])
                                 }
                                 print(f"📤 发送 trip_plan: map_data={bool(plan.get('map_data'))}")
                                 yield f"data: {json.dumps({'type': 'trip_plan', 'plan': plan}, ensure_ascii=False)}\n\n"

@@ -771,6 +771,8 @@ const handleSSEEvent = (data, aiMessage) => {
         'search_attractions': '🏛️ 搜索景点',
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
+        'review_plan': '🧐 质检行程',
+        'generate_map': '🗺️ 生成地图',
         'clarify': '❓ 补充信息',
         'confirm_needs': '📋 确认需求',
         'cancelled': '🚫 已取消',
@@ -790,6 +792,8 @@ const handleSSEEvent = (data, aiMessage) => {
         'search_attractions': '🏛️ 搜索景点',
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
+        'review_plan': '🧐 质检行程',
+        'generate_map': '🗺️ 生成地图',
         'clarify': '❓ 补充信息',
         'confirm_needs': '📋 确认需求',
         'cancelled': '🚫 已取消',
@@ -913,12 +917,33 @@ const handleSSEEvent = (data, aiMessage) => {
         'search_attractions': '🏛️ 搜索景点',
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
+        'review_plan': '🧐 质检行程',
+        'generate_map': '🗺️ 生成地图',
         'clarify': '❓ 补充信息',
         'confirm_needs': '📋 确认需求',
         'cancelled': '🚫 已取消',
         'chat': '💬 思考回复'
       }
       addThinkingStep(aiMessage, warnNodeMap[data.node] || data.node, data.message || '执行有异常', 'error')
+      break
+
+    case 'review':
+      // 自我反思：质检没过，后端正准备带着反馈重排这一版。
+      // 必须把已显示的第一版清掉（含还在打字缓冲里的尾巴），
+      // 否则第二版的 token 会接在后面，气泡里出现两份行程。
+      stopDisplayTimer()
+      displayBuffer.value = ''
+      aiMessage.content = ''
+      aiMessage.tripPlan = null
+      addThinkingStep(aiMessage, '🧐 质检行程', data.message || '发现问题，正在重排', 'running')
+      if (currentIndex >= 0) {
+        messages.value[currentIndex] = {
+          ...messages.value[currentIndex],
+          content: '',
+          tripPlan: null
+        }
+      }
+      scrollToBottom()
       break
 
     case 'interrupt':
@@ -1148,6 +1173,17 @@ const handleSend = async () => {
     emit('require-login')
     return
   }
+
+  // 上一轮还挂着没点的确认卡，用户没点按钮而是直接发了新消息：
+  // 后端这一轮会在同一个 thread 上重新走到 confirm_needs，把旧的 pending 顶掉
+  // （实测 aget_state 里只剩最后一个 interrupt）。所以旧卡必须一起撤掉——
+  // 否则界面上留着两张能点的卡，点旧的那张会拿它的字段去 resume 新的中断。
+  messages.value.forEach((m) => {
+    if (m.interrupt) {
+      m.interrupt = null
+      m.interruptEditing = false
+    }
+  })
 
   displayBuffer.value = ''
   stopDisplayTimer()
