@@ -2,8 +2,6 @@
 # app/rag/document_loader.py
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
-from docling.datamodel.base_models import InputFormat
-from docling.document_converter import DocumentConverter
 from pypdf import PdfReader
 from pathlib import Path
 from typing import List, Optional
@@ -73,7 +71,12 @@ def load_pdf_with_docling(pdf_path: str) -> List[Document]:
     - 保留表格、列表、标题层级
     - 识别图片中的文字 (OCR)
     - 输出 Markdown 格式
+
+    注意：docling 依赖很重（含 torch），这里改为函数内导入，
+    避免只跑 Markdown 索引时因为没装 docling 就整条链路起不来。
     """
+    from docling.document_converter import DocumentConverter
+
     converter = DocumentConverter()
     result = converter.convert(pdf_path)
 
@@ -275,7 +278,12 @@ class MarkdownLoader:
             if len(chunk.page_content) > 1500:
                 sub_chunks = self.text_splitter.split_text(chunk.page_content)
                 for i, sub in enumerate(sub_chunks):
-                    docs = self._create_documents(sub, chunk.metadata, i, len(sub_chunks))
+                    docs = self._create_documents(
+                        sub,
+                        {"source": file_path.name, **chunk.metadata},
+                        i,
+                        len(sub_chunks),
+                    )
                     documents.extend(docs)
             else:
                 documents.append(Document(

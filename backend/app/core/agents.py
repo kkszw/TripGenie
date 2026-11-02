@@ -1,10 +1,12 @@
 # author: szw
+import asyncio
 import json
 from datetime import date as dt_date, timedelta
 import re
-from langchain_community.chat_models import ChatTongyi
+import httpx
+from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
-from typing import Literal
+from typing import Literal, Dict, List, Any, Optional, Tuple
 from langchain_core.runnables import RunnableConfig
 from app.core.state import TripState, IntentOutput
 from app.config import settings
@@ -12,12 +14,37 @@ from app.rag.retriever import *
 from langgraph.graph import END
 from app.mcp.client import getAllTools
 
-llm = ChatTongyi(model=settings.DASHSCOPE_MODEL, api_key=settings.DASHSCOPE_API_KEY, streaming=True)
-llm_with_structure = llm.with_structured_output(IntentOutput)
+#
+# DeepSeek 走 OpenAI 兼容端点，所以统一用 ChatOpenAI 指向它，换供应商只改 .env。
+#
+# 关于思考模式：DeepSeek 默认开启（effort=high）。这里显式关闭，三个原因：
+#   1) 开启后思考阶段的 chunk.content 为空，本项目的 SSE 是按 content 转发的，
+#      前端会长时间没有任何输出，看起来像卡死；
+#   2) 按官方文档，请求里带 tools 时必须在后续请求回传 reasoning_content，否则 400。
+#      本项目每轮对话的历史是从 SQLite 重建的纯文本，拿不回 reasoning_content；
+#   3) 意图分类、JSON 行程生成不需要长链推理，开着纯亏延迟和 token（思考 token 按输出计费）。
+# 确实需要更强推理时，把 .env 的 DEEPSEEK_THINKING 改成 enabled，但要先解决第 2 点。
+llm = ChatOpenAI(
+    model=settings.deepseek_model,
+    api_key=settings.deepseek_api_key,
+    base_url=settings.deepseek_base_url,
+    streaming=True,
+    timeout=settings.llm_timeout,
+    max_retries=2,
+    extra_body={"thinking": {"type": settings.deepseek_thinking}},
+)
+# DeepSeek 不支持 response_format={"type":"json_schema"}（langchain 对 pydantic 模型的默认做法），
+# 直接调用会 400: "This response_format type is unavailable now"。
+# 改走 function_calling，把 schema 作为 tool 定义下发——DeepSeek 官方支持 tool calls。
+# 也不要用 json_mode：它要求提示词里出现 "json" 字样，且不保证 schema 完全匹配。
+llm_with_structure = llm.with_structured_output(IntentOutput, method="function_calling")
 
 tools = None
 tools_by_name = {}
 model_with_tools = None
+
+_tools_lock = asyncio.Lock()
+_tools_ready = False
 
 
 async def initialized_tools():
@@ -27,10 +54,59 @@ async def initialized_tools():
     model_with_tools = llm.bind_tools(tools)
 
 
+async def ensure_tools():
+    """确保 MCP 工具已加载（进程内只做一次）
+
+    原来 classify_input 每条消息都调 initialized_tools()，要起两个 uvx 子进程
+    重新拉工具清单并重新 bind_tools，实测 2.03s / 1.77s 一条消息——而意图分类
+    本身走的是 llm_with_structure，根本用不到工具。
+    改成「谁真正需要工具，谁在开头 await ensure_tools()」，并加锁保证并发请求
+    不会同时初始化出两份。
+    """
+    global _tools_ready
+    if _tools_ready:
+        return
+    async with _tools_lock:
+        if _tools_ready:
+            return
+        await initialized_tools()
+        _tools_ready = True
+        print(f"🔧 MCP 工具初始化完成: {len(tools)} 个")
+
+
+def parse_llm_json(text: str) -> dict:
+    """解析 LLM 返回的 JSON，容忍 markdown 代码围栏和前后多余文本。
+
+    DeepSeek 经常把 JSON 包进 ```json ... ```（实测必现），裸 json.loads 会抛
+    JSONDecodeError，导致整条行程生成被 except 吞掉——表现为前端只看到原始文本、
+    没有行程卡片和地图。这里按「原文 → 去围栏 → 截取最外层大括号」依次尝试。
+    """
+    if not isinstance(text, str):
+        text = str(text)
+
+    candidates = [text]
+    stripped = text.strip()
+    fence = re.match(r"^```[a-zA-Z]*\s*(.*?)\s*```$", stripped, re.S)
+    if fence:
+        candidates.append(fence.group(1))
+    start, end = stripped.find("{"), stripped.rfind("}")
+    if start != -1 and end > start:
+        candidates.append(stripped[start:end + 1])
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    raise ValueError(f"无法解析为 JSON，原始内容前 200 字符：{text[:200]}")
+
+
 async def classify_input(state: TripState):
     """分析用户的输入并路由到目标节点"""
     user_input = state["user_input"]
-    await initialized_tools()
+    # 注意：这里不需要 ensure_tools()。意图分类走 llm_with_structure，
+    # 不 bind 任何工具；放在这里只会让每条消息白等 2 秒去拉 MCP 工具清单。
     system_prompt = """
        你是一个意图分类器。分析用户输入，判断意图类型。
 
@@ -60,13 +136,13 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
         分析用户的旅行需求，提取关键信息：
         用户输入：{state['user_input']}
     
-        请只返回如下的JSON格式：
+        请只返回如下的JSON格式（不要加代码围栏）：
         {{
-            "destination": "目的地（如果没提到则为空,如果找到了请以省名市名的格式返回，如（山东省临沂市））",
-            "days": 天数（数字，默认3）,
-            "budget": 预算（数字，默认5000）,
-            "preferences": ["偏好1", "偏好2"]
-            "start_data": 起始日期，没有则默认为{dt_date.today().isoformat()}
+            "destination": "目的地，没提到则填空字符串；提到则用 省名+市名，例如 辽宁省大连市",
+            "days": 3,
+            "budget": 5000,
+            "preferences": ["偏好1", "偏好2"],
+            "start_date": "{dt_date.today().isoformat()}"
         }}
         """
     writer = config.get("configurable", {}).get("writer") if config else None
@@ -83,12 +159,13 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
         content = " ".join(str(item) for item in content)
     try:
         print(f"📄 format_input 提取的 JSON: {content}")
-        data = json.loads(content)
-        state["destination"] = data.get("destination")
+        data = parse_llm_json(content)
+        state["destination"] = data.get("destination") or ""
         state["days"] = data.get("days", 3)
         state["budget"] = data.get("budget", 5000)
         state["preferences"] = data.get("preferences", [])
-        state["start_date"] = data.get("start_data")
+        # 兼容旧字段名 start_data；缺失时保留调用方传入的 start_date（不要覆盖成 None）
+        state["start_date"] = data.get("start_date") or data.get("start_data") or state.get("start_date")
     except Exception as e:
         state["error"] = "解析用户输入失败"
         print(f"format_input错误：{e}")
@@ -114,77 +191,95 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
 
 async def retrieve_guides(state: TripState, config: RunnableConfig = None):
     """从攻略库检索相关文档（RAG）"""
+    writer = config.get("configurable", {}).get("writer") if config else None
+    if writer:
+        writer({
+            "type": "node_start",
+            "node": "📚 检索攻略",
+            "message": "正在搜索相关旅游攻略..."
+        })
     try:
-        writer = config.get("configurable", {}).get("writer") if config else None
-        if writer:
-            writer({
-                "type": "node_start",
-                "node": "📚 检索攻略",
-                "message": "正在搜索相关旅游攻略..."
-            })
         query = f"去{state['destination']}玩{state['days']}天，预算{state.get('budget')},喜欢{' '.join(state.get('preferences'))}"
-        docs = retrieve_context(query, top_k=5).get("docs")
+        # retrieve_context 内部是同步的 embedding HTTP 调用，直接跑会阻塞事件循环
+        # （SSE 心跳、其它请求一起卡住），丢到线程池里执行。
+        # 只取已格式化的 context 文本：原来把 List[Document] 直接塞进 prompt，
+        # 发给模型的是 `[Document(page_content='...', metadata={...})]` 的 Python repr。
+        ctx = await asyncio.to_thread(retrieve_context, query, top_k=5)
         if writer:
             writer({
                 "type": "node_end",
                 "node": "📚 检索攻略",
-                "message": f"找到 {len(docs)} 篇攻略"
+                "message": f"找到 {len(ctx.get('docs') or [])} 篇攻略"
             })
-        return {"similar_guides": docs}
+        return {"similar_guides": ctx.get("context", "")}
     except Exception as e:
         print(f"错误，retrieve_guides出现错误{e}")
+        # 不能只 print 后隐式返回 None：LangGraph 会把 None 当"空更新"直接放过，
+        # 用户拿到一份没有攻略依据的行程，却不知道检索失败了。写进专门的键让前端可见。
+        # 用 guides_error 而不是共用的 error：三个并行节点同时写 error 会 InvalidUpdateError。
+        return {"guides_error": f"攻略检索失败: {e}"}
 
 
 async def search_attractions_node(state: TripState, config: RunnableConfig = None):
     """搜索景点"""
+    writer = config.get("configurable", {}).get("writer") if config else None
+    if writer:
+        writer({
+            "type": "node_start",
+            "node": "📚 搜索景点",
+            "message": "正在搜索相关旅游景点..."
+        })
     try:
-        writer = config.get("configurable", {}).get("writer") if config else None
-        if writer:
-            writer({
-                "type": "node_start",
-                "node": "📚 搜索景点",
-                "message": "正在搜索相关旅游景点..."
-            })
         query = f"{state['destination']}的景点推荐,喜好：{' '.join(state.get('preferences'))}"
-        docs = retrieve_context(query, top_k=5).get("docs")
+        ctx = await asyncio.to_thread(retrieve_context, query, top_k=5)
         if writer:
             writer({
                 "type": "node_end",
                 "node": "📚 搜索景点",
-                "message": f"找到 {len(docs)} 篇攻略"
+                "message": f"找到 {len(ctx.get('docs') or [])} 篇攻略"
             })
-        return {"attractions_pool": docs}
+        return {"attractions_pool": ctx.get("context", "")}
     except Exception as e:
         print(f"错误，search_attractions_node出现错误:{e}")
+        return {"attractions_error": f"景点检索失败: {e}"}
 
 
 async def get_weather_node(state: TripState, config: RunnableConfig = None):
     """获取天气信息"""
+    writer = config.get("configurable", {}).get("writer") if config else None
+    if writer:
+        writer({
+            "type": "node_start",
+            "node": "获取天气信息",
+            "message": "正在获取天气信息..."
+        })
     try:
-        writer = config.get("configurable", {}).get("writer") if config else None
-        if writer:
-            writer({
-                "type": "node_start",
-                "node": "获取天气信息",
-                "message": "正在获取天气信息..."
-            })
-        query = f"{state.get("destination")}的天气如何"
+        await ensure_tools()
+        query = f"{state.get('destination')}的天气如何"
         response = await model_with_tools.ainvoke(query)
+        # 原来直接 response.tool_calls[0]：模型没返回 tool_call 就 IndexError，
+        # 被下面的 except 吞掉，天气永远是"未知"。
+        if not response.tool_calls:
+            print("⚠️ 天气节点：模型没有返回工具调用，跳过天气查询")
+            return {"weather_info": None}
         tool_call = response.tool_calls[0]
         tool_name = tool_call['name']
         tool_args = tool_call['args']
         tool = tools_by_name.get(tool_name)
-        if tool:
-            weather_result = await tool.ainvoke(tool_args)
-            if writer:
-                writer({
-                    "type": "node_end",
-                    "node": "获取天气信息",
-                    "message": "天气信息获取完毕..."
-                })
-            return {"weather_info": weather_result}
+        if not tool:
+            print(f"⚠️ 天气节点：工具 {tool_name} 不存在")
+            return {"weather_info": None, "weather_error": f"天气工具 {tool_name} 不可用"}
+        weather_result = await tool.ainvoke(tool_args)
+        if writer:
+            writer({
+                "type": "node_end",
+                "node": "获取天气信息",
+                "message": "天气信息获取完毕..."
+            })
+        return {"weather_info": weather_result}
     except Exception as e:
         print(f"错误，get_weather_node出现错误:{e}")
+        return {"weather_info": None, "weather_error": f"天气获取失败: {e}"}
 
 
 async def generate_plan_node(state: TripState, config: RunnableConfig = None) -> TripState:
@@ -206,13 +301,13 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
         {
           "time": "09:00-10:30",
           "activity": "抵达大连，入住酒店（推荐青泥洼桥附近经济型酒店）",
-          "description":  ,
+          "description": "该活动的具体说明与实用提示",
           "cost": 180
         },
         {
           "time": "11:00-12:30",
           "activity": "游览中山广场，欣赏俄式、日式与欧式混合建筑群",
-          "description":  ,
+          "description": "该活动的具体说明与实用提示",
           "cost": 0
         },
         {
@@ -224,7 +319,7 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
         {
           "time": "14:00-17:00",
           "activity": "星海广场散步，欣赏跨海大桥，海边拍照",
-          "description":  ,
+          "description": "该活动的具体说明与实用提示",
           "cost": 0
         },
         {
@@ -257,12 +352,13 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
     开始日期：{start_date_str}
 
     参考攻略：
-    {state.get('similar_guides', ['无'])}
+    {state.get('similar_guides') or '无'}
 
     可用景点：
-    {state.get('attractions_pool', [])}
+    {state.get('attractions_pool') or '无'}
 
     请生成详细的每日行程，包含景点、餐饮、住宿建议。
+    只输出一个 JSON 对象，不要加 ```json 代码围栏，不要输出任何解释文字。
     返回 JSON 格式，包含每天的具体安排,格式如下所示：{templet}
     """
     writer = config.get("configurable", {}).get("writer") if config else None
@@ -290,7 +386,7 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
                 })
 
     try:
-        data = json.loads(full_response)
+        data = parse_llm_json(full_response)
         print("✅ JSON 解析成功")
 
         # raise SystemExit("调试结束")
@@ -417,10 +513,186 @@ async def extract_attractions_with_llm(state: TripState, plan_data: dict) -> Lis
         return []
 
 
+AMAP_PLACE_TEXT_URL = "https://restapi.amap.com/v3/place/text"
+
+# POI 名字里带这些词的通常是停车场、出入口之类的配套设施，不是景点本体
+_POI_NOISE = ("停车场", "停车楼", "售票处", "出入口", "公厕", "卫生间",
+              "地铁站", "公交站", "充电站", "管理中心")
+
+
+def _pick_best_poi(name: str, pois: List[Dict]) -> Optional[Dict]:
+    """从 POI 搜索结果里挑和目标名字最贴近的一条
+
+    高德 REST 返回是按相关性排序的，所以给首位一点权重 —— 像"椰梦长廊"这种
+    横跨 20km 的线性景点，首位（椰林海滩，中段）比"椰梦长廊灯塔"（最西端）更贴合行程。
+    """
+    best: Optional[Dict] = None
+    best_score = -1
+    for i, p in enumerate(pois):
+        loc = p.get("location") or ""
+        if not isinstance(loc, str) or "," not in loc:
+            continue
+        pname = p.get("name") or ""
+        score = 0
+        if pname == name:
+            score += 100
+        elif name and name in pname:
+            # 包含但更长（"椰梦长廊" vs "椰梦长廊-椰林海滩"），长度差越大越不像本体
+            score += 60 - max(0, len(pname) - len(name)) * 2
+        elif pname and pname in name:
+            score += 40
+        else:
+            score += 5
+        if any(w in pname for w in _POI_NOISE):
+            score -= 50
+        if i == 0:
+            score += 12
+        if score > best_score:
+            best_score, best = score, p
+    return best if best_score > 0 else None
+
+
+async def _poi_search_rest(name: str, city_name: str) -> Optional[Dict]:
+    """高德 REST POI 关键词搜索，作为 maps_geo 的降级方案
+
+    为什么要多这一步：maps_geo 是"地址→坐标"解析，遇到非规范名称（LLM 常自己编，
+    比如把「三亚国际免税城」写成「三亚免税城」）时不报错，而是返回市/区县中心点。
+    换成 POI 搜索就能命中「中免集团·三亚国际免税城」这类真实条目。
+    走 REST 而不是 MCP 的原因：一次 HTTP 约 50ms，而每次 MCP 工具调用都要拉起子进程（约 1s）。
+    """
+    key = getattr(settings, "amap_api_key", None)
+    if not key or not name:
+        return None
+
+    params = {"key": key, "keywords": name, "offset": 10, "page": 1, "extensions": "base"}
+    if city_name:
+        params["city"] = city_name
+        params["citylimit"] = "true"
+
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(AMAP_PLACE_TEXT_URL, params=params)
+            data = resp.json()
+    except Exception as e:
+        print(f"  ⚠️ POI 搜索请求失败: {e}")
+        return None
+
+    if str(data.get("status")) != "1":
+        print(f"  ⚠️ POI 搜索返回异常: {data.get('info')} ({data.get('infocode')})")
+        return None
+
+    pois = data.get("pois") or []
+    if not pois:
+        return None
+
+    best = _pick_best_poi(name, pois)
+    if not best:
+        return None
+    lng_str, lat_str = best["location"].split(",")[:2]
+    print(f"  🔎 POI 搜索命中: {best.get('name')!r} "
+          f"({best.get('adname') or ''}) -> {lng_str},{lat_str}")
+    return {"lng": float(lng_str), "lat": float(lat_str)}
+
+
+async def geocode_attraction(geo_tool, name: str, city_name: str,
+                             idx: int = 0, total: int = 0) -> Optional[Dict]:
+    """查单个景点的精确坐标，查不到返回 None（不编造坐标）
+
+    高德对不规范的名字会静默返回"城市中心点"而不是报错，所以这里用
+    parse_coordinates 的行政区级校验把那种结果挡掉，再逐级降级：
+      1. 地理编码：城市名 + 景点名（景点名已含城市名时不重复拼）
+      2. REST POI 关键词搜索（能命中非规范名称，比如"椰梦长廊-椰林海滩"）
+      3. 裸景点名再走一次地理编码（"椰梦长廊"这种本地名带城市反而查不到）
+    三级都失败才交给上层做估算排布。
+    """
+    candidates = []
+    base = name
+    if city_name and not base.startswith(city_name):
+        base = f"{city_name}{name}"
+    candidates.append(base)
+
+    # 1) 组合名地理编码
+    if geo_tool:
+        try:
+            print(f"📍 [{idx}/{total}] 地理编码 {name}（搜索: {base}）...")
+            result = await geo_tool.ainvoke({"address": base, "city": city_name or None})
+            coords = parse_coordinates(result)
+            if coords:
+                print(f"  ✅ 坐标: {coords['lng']}, {coords['lat']}")
+                return coords
+            print(f"  ⚠️ 「{base}」未定位到具体地点")
+        except Exception as e:
+            print(f"  ❌ 地理编码「{base}」异常: {e}")
+
+    # 2) POI 关键词搜索兜底
+    coords = await _poi_search_rest(name, city_name)
+    if coords:
+        return coords
+
+    # 3) 裸名地理编码
+    if geo_tool and base != name:
+        try:
+            print(f"📍 [{idx}/{total}] 地理编码 {name}（裸名: {name}）...")
+            result = await geo_tool.ainvoke({"address": name, "city": city_name or None})
+            coords = parse_coordinates(result)
+            if coords:
+                print(f"  ✅ 坐标: {coords['lng']}, {coords['lat']}")
+                return coords
+            print(f"  ⚠️ 「{name}」未定位到具体地点")
+        except Exception as e:
+            print(f"  ❌ 地理编码「{name}」异常: {e}")
+
+    print(f"  ⚠️ {name} 三级查询均失败，将使用估算坐标")
+    return None
+
+
+def _scatter_around(center: Tuple[float, float], index: int, total: int,
+                    radius: float = 0.012) -> Tuple[float, float]:
+    """在中心点周围按环形均匀撒点，用于给定位失败的景点一个"看得见但不精确"的位置
+
+    半径 0.012 度约 1.3km，视觉上能分开又不至于跑到城外。
+    经度方向按 cos(lat) 修正，否则高纬度地区环会被压扁。
+    """
+    import math
+
+    angle = 2 * math.pi * index / max(total, 1)
+    lng = center[0] + radius * math.cos(angle) / max(math.cos(math.radians(center[1])), 0.2)
+    lat = center[1] + radius * math.sin(angle)
+    return round(lng, 6), round(lat, 6)
+
+
+async def _resolve_center_base(located: List[Dict], geo_tool, city_name: str,
+                               fallback: Tuple[float, float]) -> Tuple[float, float]:
+    """给"定位失败的景点"找一个合理的估算基准
+
+    优先级：本次已成功定位的景点均值 > 高德对城市本身的地理编码 > .env 兜底。
+    以前直接用 .env 的 DEFAULT_MAP_LNG/LAT，那些值是大连的，三亚的景点会被画到大连去。
+    """
+    if located:
+        return (
+            round(sum(a["lng"] for a in located) / len(located), 6),
+            round(sum(a["lat"] for a in located) / len(located), 6),
+        )
+    if geo_tool and city_name:
+        try:
+            # allow_admin=True：这里要的就是城市中心点
+            result = await geo_tool.ainvoke({"address": city_name, "city": city_name})
+            coords = parse_coordinates(result, allow_admin=True)
+            if coords:
+                print(f"📌 城市中心（{city_name}）: {coords['lng']}, {coords['lat']}")
+                return coords["lng"], coords["lat"]
+        except Exception as e:
+            print(f"⚠️ 获取城市中心失败: {e}")
+    print(f"⚠️ 拿不到城市中心，回退到 .env 兜底坐标 {fallback}")
+    return fallback
+
+
 async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
     """生成地图数据：景点坐标和路线"""
     try:
         print("🗺️ 开始生成地图数据...map_data")
+        # 地图数据依赖 maps_geo / 驾车路线的工具对象，这里保证工具已加载
+        await ensure_tools()
         # 1. 提取所有景点
         attractions = await extract_attractions_with_llm(state, plan_data)
         print(f"📋 共 {len(attractions)} 个景点待获取坐标")
@@ -442,51 +714,39 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
             city_name = city_name.split("市")[0]
         city_name = city_name.strip()
 
+        # 精确定位成功的和失败的先分开，失败的最后统一做估算排布
+        located: List[Dict] = []
+        failed: List[Dict] = []
+
         for idx, attr in enumerate(attractions):
-            try:
-                if geo_tool:
-                    # ✅ 用城市+景点名组合搜索
-                    search_address = f"{city_name}{attr['name']}" if city_name else attr['name']
+            coords = None
+            if geo_tool:
+                coords = await geocode_attraction(
+                    geo_tool, attr["name"], city_name, idx + 1, len(attractions)
+                )
+            else:
+                print("  ⚠️ geo_tool 不存在，所有景点都将使用估算坐标")
 
-                    print(f"📍 [{idx + 1}/{len(attractions)}] 获取 {attr['name']} 坐标（搜索: {search_address}）...")
+            if coords:
+                located.append({**attr, "lng": coords["lng"], "lat": coords["lat"]})
+            else:
+                failed.append(attr)
 
-                    result = await geo_tool.ainvoke({
-                        "address": search_address,
-                        "city": city_name
-                    })
+        # 定位失败的景点：围绕城市中心环形散开，并打 approx 标记
+        # （前端据此用虚线/灰色样式提示"位置是估算的"，不再让它顶替掉真实景点）
+        if failed:
+            center_base = await _resolve_center_base(
+                located, geo_tool, city_name, (base_lng, base_lat)
+            )
+            print(f"⚠️ {len(failed)} 个景点未精确定位，围绕 {center_base} 估算排布: "
+                  f"{[a['name'] for a in failed]}")
+            for i, attr in enumerate(failed):
+                lng, lat = _scatter_around(center_base, i, len(failed))
+                located.append({**attr, "lng": lng, "lat": lat, "approx": True})
 
-                    print(f"  原始返回: {str(result)[:300]}")
-
-                    coords = parse_coordinates(result)
-                    if coords:
-                        attractions_with_coords.append({
-                            **attr,
-                            "lng": coords["lng"],
-                            "lat": coords["lat"]
-                        })
-                        print(f"  ✅ 坐标: {coords['lng']}, {coords['lat']}")
-                        continue
-                    else:
-                        print(f"  ⚠️ 解析坐标失败，使用默认坐标")
-                else:
-                    print(f"  ⚠️ geo_tool 不存在")
-
-                # fallback：使用默认坐标（大连市中心 + 偏移）
-                attractions_with_coords.append({
-                    **attr,
-                    "lng": base_lng + (idx * 0.008),
-                    "lat": base_lat + (idx * 0.006)
-                })
-
-            except Exception as e:
-                print(f"  ❌ 获取 {attr['name']} 坐标失败: {e}")
-                attractions_with_coords.append({
-                    **attr,
-                    "lng": base_lng + (idx * 0.008),
-                    "lat": base_lat + (idx * 0.006)
-                })
-
-        print(f"🔍 坐标获取完成: {len(attractions_with_coords)} 个景点")
+        attractions_with_coords = located
+        print(f"🔍 坐标获取完成: {len(attractions_with_coords)} 个景点"
+              f"（精确定位 {len(located) - len(failed)} 个，估算 {len(failed)} 个）")
 
         # 3. 规划路线（如果有多个景点）
         routes = []
@@ -547,11 +807,13 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
                     })
                     existing_names.add(point)
                     print(f"➕ 补全景点: {point} ({coord})")
-        # 地图中心取所有已定位景点的均值，作为前端无有效坐标时的兜底
-        if attractions_with_coords:
+        # 地图中心取精确坐标的均值（估算点不参与，否则会把中心拉偏）
+        precise = [a for a in attractions_with_coords if not a.get("approx")]
+        center_source = precise or attractions_with_coords
+        if center_source:
             center = (
-                sum(a["lng"] for a in attractions_with_coords) / len(attractions_with_coords),
-                sum(a["lat"] for a in attractions_with_coords) / len(attractions_with_coords),
+                round(sum(a["lng"] for a in center_source) / len(center_source), 6),
+                round(sum(a["lat"] for a in center_source) / len(center_source), 6),
             )
         else:
             center = (base_lng, base_lat)
@@ -590,8 +852,35 @@ def parse_route_result(result: Any) -> Dict:
     return {"distance": 0, "duration": 0, "polyline": []}
 
 
-def parse_coordinates(result) -> Dict:
-    """解析高德地理编码结果（适配 MCP 返回格式）"""
+# 高德地理编码结果里的"行政区级" level 取值。这类结果的 location 是城市/区县中心点，
+# 不是具体景点坐标。以前不校验它，导致查不到的景点全部落到同一个城市中心点上
+# （三亚"椰梦长廊"和"三亚免税城"就是这样重合的，地图上只看得见后画的那个点）。
+# 注意高德的取值是"省"/"市"/"区县"，不是"省份"/"城市"，实测得到的。
+_ADMIN_LEVELS = {"国家", "省", "省份", "市", "城市", "区县", "开发区"}
+
+
+def _is_admin_level(item: Dict) -> bool:
+    """判断一条 geocode 结果是否只定位到行政区，而非具体地点"""
+    if not isinstance(item, dict):
+        return False
+    level = (item.get("level") or "").strip()
+    if level in _ADMIN_LEVELS:
+        return True
+    if not level:
+        # 老接口没有 level 字段，用 district 兜底：真实 POI 一定有区县归属
+        return not item.get("district")
+    return False
+
+
+def parse_coordinates(result, allow_admin: bool = False) -> Dict:
+    """解析高德地理编码结果（适配 MCP 返回格式）
+
+    Args:
+        result: MCP 返回结果
+        allow_admin: 是否接受"只定位到行政区"的结果。
+            False（默认）：景点用，行政区级结果直接丢弃，交给上层做估算兜底；
+            True：需要城市中心点时用（例如给定位失败的景点找估算基准）。
+    """
     import json
     import re
 
@@ -604,30 +893,39 @@ def parse_coordinates(result) -> Dict:
             item = result[0]
             if isinstance(item, dict) and "text" in item:
                 text = item["text"]
+                parsed = False
                 try:
                     data = json.loads(text)
-                    coords = extract_location_from_dict(data)
+                    parsed = True
+                    coords = extract_location_from_dict(data, allow_admin=allow_admin)
                     if coords:
                         return coords
                 except json.JSONDecodeError:
                     pass
-                # JSON 解析失败，用正则兜底
+                # 注意：JSON 解析成功但被校验拒绝时，绝不能再用正则兜底 ——
+                # 正则会从同一段文本里把那个"行政区中心点"又抓出来，校验就白做了。
+                if parsed:
+                    return {}
                 return extract_location_from_text(text)
 
         # ✅ 情况2：字符串（可能是 JSON 字符串）
         if isinstance(result, str):
+            parsed = False
             try:
                 data = json.loads(result)
-                coords = extract_location_from_dict(data)
+                parsed = True
+                coords = extract_location_from_dict(data, allow_admin=allow_admin)
                 if coords:
                     return coords
             except json.JSONDecodeError:
                 pass
+            if parsed:
+                return {}
             return extract_location_from_text(result)
 
         # ✅ 情况3：dict（兼容旧格式）
         if isinstance(result, dict):
-            coords = extract_location_from_dict(result)
+            coords = extract_location_from_dict(result, allow_admin=allow_admin)
             if coords:
                 return coords
 
@@ -637,14 +935,23 @@ def parse_coordinates(result) -> Dict:
     return {}
 
 
-def extract_location_from_dict(data) -> Dict:
-    """从 dict 中提取 location"""
+def extract_location_from_dict(data, allow_admin: bool = False) -> Dict:
+    """从 dict 中提取 location
+
+    allow_admin=False 时，只定位到行政区（level=城市/区县）的结果会被丢弃，
+    避免把城市中心当成景点坐标。
+    """
     try:
         if isinstance(data, dict):
             # 高德 MCP 返回：{"return": [{"location": "121.63,38.92", ...}]}
             returns = data.get("return", [])
             if returns and len(returns) > 0:
-                loc = returns[0].get("location", "")
+                item = returns[0]
+                if not allow_admin and _is_admin_level(item):
+                    print(f"   ⚠️ 只定位到行政区（level={item.get('level')!r}, "
+                          f"district={item.get('district')}），这个坐标不是景点，丢弃")
+                    return {}
+                loc = item.get("location", "")
                 if loc and "," in loc:
                     parts = loc.split(",")
                     return {"lng": float(parts[0]), "lat": float(parts[1])}
@@ -652,7 +959,10 @@ def extract_location_from_dict(data) -> Dict:
             # 兼容旧格式：{"geocodes": [{"location": "..."}]}
             geocodes = data.get("geocodes", [])
             if geocodes and len(geocodes) > 0:
-                loc = geocodes[0].get("location", "")
+                item = geocodes[0]
+                if not allow_admin and _is_admin_level(item):
+                    return {}
+                loc = item.get("location", "")
                 if loc and "," in loc:
                     parts = loc.split(",")
                     return {"lng": float(parts[0]), "lat": float(parts[1])}
@@ -699,6 +1009,7 @@ def format_response(plan_data: dict) -> str:
 
 async def chat(state: TripState, config: RunnableConfig = None):
     """对话节点，如果是正常聊天就正常调用返回对话，如果需要调用工具则调用工具"""
+    await ensure_tools()
     messages = state.get("messages", [])
     writer = config.get("configurable", {}).get("writer") if config else None
     if writer:

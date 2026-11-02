@@ -1,9 +1,12 @@
 # author: szw
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.api import chat, history
-from app.core.langgraph_app import create_workflow
+from app.api import auth, chat, history
+from app.core.agents import ensure_tools
+from app.core.langgraph_app import get_workflow
 from app.core.checkpointer import get_checkpointer
 
 app = FastAPI(
@@ -22,6 +25,7 @@ app.add_middleware(
 )
 
 # 注册路由
+app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(history.router, prefix="/api/history", tags=["history"])
 
@@ -29,9 +33,19 @@ app.include_router(history.router, prefix="/api/history", tags=["history"])
 @app.on_event("startup")
 async def startup():
     """启动时初始化"""
-    # 初始化 LangGraph 工作流
-    app.state.workflow =  await create_workflow()
+    # 初始化 LangGraph 工作流（进程内单例，chat.py 复用同一个实例）
+    app.state.workflow = await get_workflow()
     app.state.checkpointer = await get_checkpointer()
+
+    # 预热 MCP 工具清单：首次拉取要起两个 uvx 子进程（约 2s），
+    # 放到后台任务里做，不拖慢启动，也不让第一条消息承担这份开销。
+    async def _warmup_tools():
+        try:
+            await ensure_tools()
+        except Exception as e:
+            print(f"⚠️ MCP 工具预热失败（不影响启动，首次用到工具时会重试）: {e}")
+
+    asyncio.create_task(_warmup_tools())
     print("✅ TripGenie API 启动成功!")
 
 

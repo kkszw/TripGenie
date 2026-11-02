@@ -1,7 +1,11 @@
 # author: szw
+import asyncio
 from langgraph.graph import StateGraph, START
 from app.core.agents import *
 from app.core.checkpointer import get_checkpointer
+
+_workflow = None
+_workflow_lock = asyncio.Lock()
 
 
 async def create_workflow():
@@ -39,3 +43,20 @@ async def create_workflow():
     # 编译（带检查点）
     check = await get_checkpointer()
     return workflow.compile(checkpointer=check)
+
+
+async def get_workflow():
+    """获取工作流（进程内单例）
+
+    原来 chat.py 每个请求都 await create_workflow() 重新编译一遍，而 main.py 启动时
+    编译好的那个 app.state.workflow 从来没人用。
+    编译后的图是无状态的，状态由 thread_id 对应的 checkpoint 承载，
+    多请求共用同一张图是安全的。
+    """
+    global _workflow
+    if _workflow is None:
+        async with _workflow_lock:
+            if _workflow is None:
+                _workflow = await create_workflow()
+                print("✅ 工作流编译完成")
+    return _workflow

@@ -21,6 +21,9 @@ class DatabaseService:
         """获取数据库连接"""
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
+        # SQLite 默认不启用外键约束，必须每个连接显式打开，
+        # 否则 messages 表的 ON DELETE CASCADE 不会生效，删会话会留下孤儿消息
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init_db(self):
@@ -30,63 +33,122 @@ class DatabaseService:
         if not db_dir.exists():
             db_dir.mkdir(parents=True, exist_ok=True)
             print(f"✅ 创建数据库目录: {db_dir}")
-            conn = self._get_connection()
-            cursor = conn.cursor()
 
-            # 1. 创建会话表
-            cursor.execute("""CREATE TABLE IF NOT EXISTS sessions
-                              (
-                                  thread_id
-                                  TEXT
-                                  PRIMARY
-                                  KEY,
-                                  user_id
-                                  TEXT
-                                  NOT
-                                  NULL,
-                                  name
-                                  TEXT
-                                  NOT
-                                  NULL,
-                                  created_at
-                                  TEXT
-                                  NOT
-                                  NULL,
-                                  updated_at
-                                  TEXT
-                                  NOT
-                                  NULL
-                              )""")
+        # 建表必须无条件执行。CREATE TABLE IF NOT EXISTS 本身是幂等的，而一旦把建表
+        # 塞进上面的 if 里，"目录存在但表不存在"的情况（只删了 sessions.db、或 clone
+        # 后留下空目录）就永远不会建表，之后每次请求都报 no such table: sessions，
+        # 日志却照样打印"初始化完成"。
+        conn = self._get_connection()
+        cursor = conn.cursor()
 
-            # 2. 创建消息表
-            cursor.execute("""CREATE TABLE IF NOT EXISTS messages
-            (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                thread_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                map_data TEXT,
-                timestamp TEXT NOT NULL,
-                FOREIGN KEY (thread_id) REFERENCES sessions(thread_id) ON DELETE CASCADE)""")
+        # 0. 用户表（登录系统）
+        # COLLATE NOCASE：Alice 与 alice 视为同一个用户名（唯一约束也按不区分大小写生效）
+        cursor.execute("""CREATE TABLE IF NOT EXISTS users
+                          (
+                              id            TEXT PRIMARY KEY,
+                              username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                              password_hash TEXT NOT NULL,
+                              created_at    TEXT NOT NULL
+                          )""")
+        # username 已 UNIQUE，但 SQLite 的 UNIQUE 区分大小写；这里额外建索引便于查询
+        cursor.execute("""
+                       CREATE INDEX IF NOT EXISTS idx_users_username
+                           ON users (username)
+                       """)
 
-            cursor.execute("PRAGMA table_info(messages)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if "map_data" not in columns:
-                cursor.execute("ALTER TABLE messages ADD COLUMN map_data TEXT")
-                print("✅ 已自动添加 map_data 字段")
+        # 1. 创建会话表
+        cursor.execute("""CREATE TABLE IF NOT EXISTS sessions
+                          (
+                              thread_id  TEXT PRIMARY KEY,
+                              user_id    TEXT NOT NULL,
+                              name       TEXT NOT NULL,
+                              created_at TEXT NOT NULL,
+                              updated_at TEXT NOT NULL
+                          )""")
 
-            # 3. 创建索引（提高查询性能）
-            cursor.execute("""
-                           CREATE INDEX IF NOT EXISTS idx_messages_thread_id
-                               ON messages(thread_id)
-                           """)
-            cursor.execute("""
-                           CREATE INDEX IF NOT EXISTS idx_messages_timestamp
-                               ON messages(timestamp)
-                           """)
+        # 2. 创建消息表
+        cursor.execute("""CREATE TABLE IF NOT EXISTS messages
+                          (
+                              id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                              thread_id TEXT NOT NULL,
+                              role      TEXT NOT NULL,
+                              content   TEXT NOT NULL,
+                              map_data  TEXT,
+                              timestamp TEXT NOT NULL,
+                              FOREIGN KEY (thread_id) REFERENCES sessions (thread_id) ON DELETE CASCADE
+                          )""")
 
-            conn.commit()
-            conn.close()
+        # 老库可能没有 map_data 列，补上
+        cursor.execute("PRAGMA table_info(messages)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "map_data" not in columns:
+            cursor.execute("ALTER TABLE messages ADD COLUMN map_data TEXT")
+            print("✅ 已自动添加 map_data 字段")
+
+        # 3. 创建索引（提高查询性能）
+        cursor.execute("""
+                       CREATE INDEX IF NOT EXISTS idx_messages_thread_id
+                           ON messages (thread_id)
+                       """)
+        cursor.execute("""
+                       CREATE INDEX IF NOT EXISTS idx_messages_timestamp
+                           ON messages (timestamp)
+                       """)
+        # 按用户查会话是登录后的高频路径，会话表也要有 user_id 索引
+        cursor.execute("""
+                       CREATE INDEX IF NOT EXISTS idx_sessions_user_id
+                           ON sessions (user_id)
+                       """)
+
+        conn.commit()
+        conn.close()
         print("✅ 数据库初始化完成")
+
+    # ==================== 用户操作 ====================
+
+    def create_user(self, user_id: str, username: str, password_hash: str) -> Optional[Dict]:
+        """
+        创建用户。用户名已存在时返回 None（由上层转成 400）。
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        try:
+            cursor.execute("""
+                           INSERT INTO users (id, username, password_hash, created_at)
+                           VALUES (?, ?, ?, ?)
+                           """, (user_id, username, password_hash, now))
+            conn.commit()
+            return {
+                "id": user_id,
+                "username": username,
+                "created_at": now,
+            }
+        except sqlite3.IntegrityError:
+            return None
+        finally:
+            conn.close()
+
+    def get_user_by_username(self, username: str) -> Optional[Dict]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE username = ?", (username,))
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def get_user_by_id(self, user_id: str) -> Optional[Dict]:
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        row = cursor.fetchone()
+        conn.close()
+        # 去掉哈希，避免被顺手带进日志或响应
+        if row:
+            data = dict(row)
+            data.pop("password_hash", None)
+            return data
+        return None
 
     # ==================== 会话操作 ====================
 
@@ -245,7 +307,7 @@ class DatabaseService:
 
     def get_messages(self, thread_id: str, limit: int = 50) -> List[Dict]:
         """
-        获取会话的所有消息
+        获取会话最近的 limit 条消息（按时间正序返回）
 
         Args:
             thread_id: 会话ID
@@ -254,12 +316,18 @@ class DatabaseService:
         conn = self._get_connection()
         cursor = conn.cursor()
 
+        # 先倒序取"最近"的 limit 条，外层再正序排回来。
+        # 原来的 ORDER BY timestamp ASC LIMIT ? 取的是最旧的 50 条，长会话里
+        # 模型永远看不到最近说的话（"刚才那个行程改一下"会直接失忆）。
+        # 加 id 兜底：add_messages_batch 一批消息共用同一个 timestamp，只按时间排会乱序。
         cursor.execute("""
                        SELECT *
-                       FROM messages
-                       WHERE thread_id = ?
-                       ORDER BY timestamp ASC
-                           LIMIT ?
+                       FROM (SELECT *
+                             FROM messages
+                             WHERE thread_id = ?
+                             ORDER BY timestamp DESC, id DESC
+                             LIMIT ?)
+                       ORDER BY timestamp ASC, id ASC
                        """, (thread_id, limit))
 
         rows = cursor.fetchall()
