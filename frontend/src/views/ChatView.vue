@@ -125,6 +125,62 @@
 
                 <!-- ✅ 没有行程卡片时才显示原始文本 -->
                 <div v-else class="message-text" style="white-space: pre-wrap;">{{ msg.content }}</div>
+
+                <!-- HITL 确认卡：图停在 confirm_needs，等用户拍板才继续花时间检索和规划。
+                     编辑态直接改 msg.interrupt 上的字段，提交时原样作为 payload 发回。 -->
+                <div v-if="msg.interrupt" class="confirm-card">
+                  <div class="confirm-title">
+                    <span class="confirm-dot"></span>
+                    确认一下，再开始规划
+                  </div>
+
+                  <template v-if="!msg.interruptEditing">
+                    <div class="confirm-rows">
+                      <div class="confirm-row">
+                        <span class="confirm-label">目的地</span>
+                        <span class="confirm-value">{{ msg.interrupt.destination || '未指定' }}</span>
+                      </div>
+                      <div class="confirm-row">
+                        <span class="confirm-label">天数</span>
+                        <span class="confirm-value">{{ msg.interrupt.days ? msg.interrupt.days + ' 天' : '未定，先按 3 天' }}</span>
+                      </div>
+                      <div class="confirm-row">
+                        <span class="confirm-label">预算</span>
+                        <span class="confirm-value">{{ msg.interrupt.budget ? '¥ ' + msg.interrupt.budget : '不限' }}</span>
+                      </div>
+                      <div class="confirm-row" v-if="msg.interrupt.preferences && msg.interrupt.preferences.length">
+                        <span class="confirm-label">偏好</span>
+                        <span class="confirm-value">{{ msg.interrupt.preferences.join('、') }}</span>
+                      </div>
+                    </div>
+                    <div class="confirm-actions">
+                      <button class="confirm-btn primary" @click="resolveInterrupt(msg, 'confirm')">就这样，开始规划</button>
+                      <button class="confirm-btn" @click="msg.interruptEditing = true">改一改</button>
+                      <button class="confirm-btn ghost" @click="resolveInterrupt(msg, 'cancel')">算了</button>
+                    </div>
+                  </template>
+
+                  <template v-else>
+                    <div class="confirm-form">
+                      <label>
+                        <span>目的地</span>
+                        <input v-model="msg.interrupt.destination" type="text" placeholder="例如 云南省大理市"/>
+                      </label>
+                      <label>
+                        <span>天数</span>
+                        <input v-model.number="msg.interrupt.days" type="number" min="1" max="30"/>
+                      </label>
+                      <label>
+                        <span>预算（元）</span>
+                        <input v-model.number="msg.interrupt.budget" type="number" min="0" step="500"/>
+                      </label>
+                    </div>
+                    <div class="confirm-actions">
+                      <button class="confirm-btn primary" @click="resolveInterrupt(msg, 'edit', msg.interrupt)">按这个规划</button>
+                      <button class="confirm-btn ghost" @click="msg.interruptEditing = false">返回</button>
+                    </div>
+                  </template>
+                </div>
               </div>
             </div>
           </div>
@@ -188,7 +244,20 @@
               <!-- 这里可以放快捷按钮 -->
             </div>
             <div class="toolbar-right">
+              <!-- 生成中：同一个位置换成「停止」。放同一个位置而不是另加按钮，
+                   一来符合直觉（发送键变停止键），二来不会因为布局跳动点错。 -->
               <button
+                  v-if="isGenerating"
+                  class="send-btn stop-btn"
+                  title="停止生成"
+                  @click="abortStream"
+              >
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor">
+                  <rect x="1.5" y="1.5" width="9" height="9" rx="2.5"/>
+                </svg>
+              </button>
+              <button
+                  v-else
                   class="send-btn"
                   :class="{ active: inputText.trim() }"
                   @click="handleSend"
@@ -298,6 +367,45 @@ const displayBuffer = ref('')  // 待显示的内容缓冲区
 const displayInterval = ref(null)  // 定时器
 const DISPLAY_SPEED = 5  // 每次显示的字符数
 const DISPLAY_INTERVAL = 40  // 显示间隔（毫秒）
+
+// ===== 流式请求的可取消状态 =====
+// isLoading 只表示"还没有第一个节点返回"（node_start 一收到就被置 false），
+// 所以不能拿它判断"是否正在生成"。暂停/停止按钮需要的是"整条流还没结束"。
+const isGenerating = ref(false)
+let activeController = null  // 当前这一轮流式请求的 AbortController
+
+// 停止当前这一轮生成：掐断 fetch → reader.read() 抛 AbortError → handleSend 的
+// catch 负责把气泡收尾。切换会话、组件卸载时也调它，否则旧流会继续往
+// messages.value 里写，而那时数组已经换成新会话的消息了。
+const abortStream = () => {
+  if (activeController) {
+    activeController.abort()
+    activeController = null
+  }
+  isGenerating.value = false
+  // 旧流的三点动画和打字机缓冲也要一起收掉：
+  // 切会话时 messages 已经换掉，缓冲里剩下的字会无处可写。
+  isLoading.value = false
+  // 这里不调 stopDisplayTimer()：它定义在下面，而 watch(immediate) 会在 setup
+  // 期间就走到这里，此时那个 const 还在 TDZ 里。直接清这两个 ref 等价且安全。
+  if (displayInterval.value) {
+    clearInterval(displayInterval.value)
+    displayInterval.value = null
+  }
+  displayBuffer.value = ''
+}
+
+// 按消息自身定位，而不是「数组最后一条」。
+// handleSSEEvent / 打字机定时器原来都用 messages.value.length - 1 算下标，
+// 一旦用户切到别的会话，那个下标指向的就是新会话的最后一条消息——
+// 旧会话的 chunk 会被写进新会话的界面（串台）。
+// 顺便说明为什么用字符串字段而不是 Symbol：这些消息对象会经过 {...msg} 展开复制，
+// 字符串键一定会被带上，调试时也能直接在 DEVTOOLS 里看到。
+const aiMsgIndex = (aiMessage) => {
+  const id = aiMessage && aiMessage.aiMsgId
+  if (!id) return -1
+  return messages.value.findIndex(m => m && m.aiMsgId === id)
+}
 
 const {
   loadSessions,          // 只用于刷新侧边栏
@@ -446,9 +554,12 @@ const loadSessionMessagesFromDB = async (threadId) => {
       return
     }
 
-    messages.value = msgs.map(msg => {
+    messages.value = msgs.map((msg, index) => {
       // 基础消息对象
       const message = {
+        // 历史消息也要有身份：确认卡可能挂在这些消息上，点确认后要走
+        // aiMsgIndex 定位回它（否则写入会被 -1 挡掉，界面没反应）
+        aiMsgId: `hist-${index}-${Date.now()}`,
         role: msg.type === 'human' || msg.role === 'user' ? 'user' : 'assistant',
         content: msg.content || '',
         timestamp: msg.timestamp || new Date().toISOString(),
@@ -487,10 +598,41 @@ const loadSessionMessagesFromDB = async (threadId) => {
     const mapCount = messages.value.filter(m => m.tripPlan?.map_data).length
     console.log(`📊 加载完成: ${messages.value.length} 条消息, ${planCount} 个行程, ${mapCount} 个地图`)
 
+    // 中断那一轮不落库（见后端 _run_stream 的注释），所以刷新/切回会话时
+    // 要靠 checkpoint 把确认卡找回来，否则用户只能把整句话重发一遍。
+    await attachPendingInterrupt(threadId)
+
     scrollToBottom()
 
   } catch (error) {
     console.error('加载会话消息失败:', error)
+  }
+}
+
+// ===== 刷新后把待确认的中断找回来 =====
+const attachPendingInterrupt = async (threadId) => {
+  try {
+    const {pending} = await api.getPending(threadId)
+    if (!pending) return
+
+    const last = messages.value[messages.value.length - 1]
+    if (last && last.role === 'assistant') {
+      last.interrupt = pending
+      last.interruptEditing = false
+    } else {
+      // 中断时只落库了用户那句，界面上还没有 AI 气泡，补一条空消息承载卡片
+      messages.value.push({
+        aiMsgId: `pending-${Date.now()}`,
+        role: 'assistant',
+        content: '',
+        timestamp: new Date().toISOString(),
+        tripPlan: null,
+        interrupt: pending,
+        interruptEditing: false
+      })
+    }
+  } catch (e) {
+    console.warn('查询待确认状态失败:', e)
   }
 }
 
@@ -610,7 +752,9 @@ const toggleThinking = (index) => {
 const handleSSEEvent = (data, aiMessage) => {
   console.log('📨 收到 SSE 事件:', data)
 
-  const currentIndex = messages.value.length - 1
+  // 按本次请求那条消息定位；找不到（用户已切走、列表被清空）就是 -1，
+  // 下面所有 `currentIndex >= 0` 的判断自然会把写入全部挡掉，不会串到别的会话。
+  const currentIndex = aiMsgIndex(aiMessage)
 
   switch (data.type) {
     case 'node_start':
@@ -628,6 +772,8 @@ const handleSSEEvent = (data, aiMessage) => {
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
         'clarify': '❓ 补充信息',
+        'confirm_needs': '📋 确认需求',
+        'cancelled': '🚫 已取消',
         'chat': '💬 思考回复'
       }
 
@@ -645,6 +791,8 @@ const handleSSEEvent = (data, aiMessage) => {
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
         'clarify': '❓ 补充信息',
+        'confirm_needs': '📋 确认需求',
+        'cancelled': '🚫 已取消',
         'chat': '💬 思考回复'
       }
       const displayNodeEnd = nodeMapEnd[data.node] || data.node
@@ -766,9 +914,36 @@ const handleSSEEvent = (data, aiMessage) => {
         'get_weather': '🌤️ 获取天气',
         'generate_plan': '📝 生成行程',
         'clarify': '❓ 补充信息',
+        'confirm_needs': '📋 确认需求',
+        'cancelled': '🚫 已取消',
         'chat': '💬 思考回复'
       }
       addThinkingStep(aiMessage, warnNodeMap[data.node] || data.node, data.message || '执行有异常', 'error')
+      break
+
+    case 'interrupt':
+      // HITL：图停在 confirm_needs 等用户拍板。这一轮没有正文，也不会有 done。
+      // 载荷挂到消息上，模板渲染成确认卡；点按钮走 resolveInterrupt → /api/chat/resume。
+      console.log('⏸️ 等待用户确认:', data.payload)
+      isLoading.value = false
+      stopDisplayTimer()
+      aiMessage.isProcessing = false
+      aiMessage.isThinking = false
+      aiMessage.showThinking = false
+      aiMessage.interrupt = data.payload
+      // 直接在载荷上编辑（v-model 绑 msg.interrupt.*），省一份草稿状态的同步代码
+      aiMessage.interruptEditing = false
+
+      if (currentIndex >= 0) {
+        messages.value[currentIndex] = {
+          ...messages.value[currentIndex],
+          isProcessing: false,
+          isThinking: false,
+          showThinking: false,
+          interrupt: data.payload,
+          interruptEditing: false
+        }
+      }
       break
 
     case 'error':
@@ -858,9 +1033,9 @@ const flushDisplayBuffer = (aiMessage) => {
   aiMessage.content += displayBuffer.value
   displayBuffer.value = ''
 
-  const lastMsg = messages.value[messages.value.length - 1]
-  if (lastMsg && lastMsg.role === 'assistant') {
-    lastMsg.content = aiMessage.content
+  const index = aiMsgIndex(aiMessage)
+  if (index >= 0) {
+    messages.value[index].content = aiMessage.content
   }
 
   scrollToBottom()
@@ -885,13 +1060,9 @@ const startDisplayTimer = (aiMessage) => {
 
     aiMessage.content += chunk
 
-    const currentIndex = messages.value.length - 1
-    if (currentIndex >= 0 && messages.value[currentIndex]?.role === 'assistant') {
-      const currentMsg = messages.value[currentIndex]
-      messages.value[currentIndex] = {
-        ...currentMsg,
-        content: aiMessage.content
-      }
+    const currentIndex = aiMsgIndex(aiMessage)
+    if (currentIndex >= 0) {
+      messages.value[currentIndex].content = aiMessage.content
     }
 
     scrollToBottom()
@@ -914,10 +1085,63 @@ const handleExample = (text) => {
   handleSend()
 }
 
+// ===== 消费一条 SSE 流 =====
+// 首次发送和「确认后恢复」返回的都是 SSE，所以抽出来共用。
+// controller 由调用方持有：停止 / 切会话 / 卸载都靠它把 reader 打断。
+const consumeStream = async (response, aiMessage, threadId, controller) => {
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (!controller.signal.aborted) {
+    const {done, value} = await reader.read()
+    if (done) break
+    if (controller.signal.aborted) break  // 已取消：剩下的残包不再处理
+
+    buffer += decoder.decode(value, {stream: true})
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      if (controller.signal.aborted) break
+      if (!line.startsWith('data: ')) continue
+      try {
+        const data = JSON.parse(line.slice(6))
+
+        if (data.thread_id && data.thread_id !== threadId) {
+          currentThreadId.value = data.thread_id
+          emit('thread-created', data.thread_id)
+        }
+
+        handleSSEEvent(data, aiMessage)
+
+        // 只同步"这条消息自己"，不再按数组末尾猜
+        const idx = aiMsgIndex(aiMessage)
+        if (idx >= 0) {
+          messages.value[idx].content = aiMessage.content
+          messages.value[idx].tripPlan = aiMessage.tripPlan
+          // 确认卡：中断时挂在 aiMessage 上，这里同步进列表才会渲染
+          messages.value[idx].interrupt = aiMessage.interrupt
+        }
+
+        if (data.done) {
+          await loadSessions()
+        }
+        scrollToBottom()
+      } catch (e) {
+        // 忽略非 JSON 行
+      }
+    }
+  }
+}
+
 // ===== 发送消息 =====
 const handleSend = async () => {
   const text = inputText.value.trim()
-  if (!text || isLoading.value) return
+  // isLoading 只在"还没收到第一个节点"时为 true，之后 textarea 就解禁了。
+  // 少了 isGenerating 这层判断，用户在生成途中按 Enter 会再起一条流：
+  // activeController 被覆盖，上一条流既停不下来、又还在往界面上写。
+  if (!text || isLoading.value || isGenerating.value) return
 
   // 未登录不发请求：留住输入框里的文字，只唤起登录窗
   if (!isLoggedIn.value) {
@@ -938,6 +1162,9 @@ const handleSend = async () => {
 
   // ✅ 创建 AI 消息占位，默认展开思考过程
   const aiMessage = {
+    // 这条消息自己的身份。流式回调里靠它定位，而不是靠"数组最后一条"，
+    // 否则切会话时旧流会写进新会话（见 aiMsgIndex 的注释）。
+    aiMsgId: `ai-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     role: 'assistant',
     content: '',
     timestamp: new Date().toISOString(),
@@ -965,58 +1192,98 @@ const handleSend = async () => {
 
   const threadId = props.threadId || currentThreadId.value
 
+  // 这一轮自己的取消句柄。点「停止」、切换会话、组件卸载都靠它把请求掐断。
+  // 不做这件事的话：旧 SSE 流会一直读到 done，中途用户已经切走的会话里，
+  // 那些 chunk 会按"数组最后一条"写进新会话的界面。
+  const controller = new AbortController()
+  activeController = controller
+  isGenerating.value = true
+
   try {
-    const response = await api.sendMessage(threadId, text)
-
-    if (!response.ok) {
-      const errorText = await response.text()
-      throw new Error(`HTTP ${response.status}: ${errorText}`)
-    }
-
-    const reader = response.body.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-
-    while (true) {
-      const {done, value} = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, {stream: true})
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6))
-
-            if (data.thread_id && data.thread_id !== threadId) {
-              currentThreadId.value = data.thread_id
-              emit('thread-created', data.thread_id)
-            }
-
-            handleSSEEvent(data, aiMessage)
-
-            const lastMsg = messages.value[messages.value.length - 1]
-            if (lastMsg && lastMsg.role === 'assistant') {
-              lastMsg.content = aiMessage.content
-              lastMsg.tripPlan = aiMessage.tripPlan
-            }
-
-            if (data.done) {
-              await loadSessions()
-            }
-            scrollToBottom()
-          } catch (e) {
-            // 忽略非 JSON 行
-          }
-        }
-      }
-    }
+    const response = await api.sendMessage(threadId, text, {signal: controller.signal})
+    await consumeStream(response, aiMessage, threadId, controller)
   } catch (error) {
-    console.error('❌ 发送失败:', error)
-    aiMessage.content = `抱歉，出错了: ${error.message || '请重试'}`
+    // 取消会以 AbortError 的形式从 fetch / reader.read() 抛出来。
+    // 那是用户主动停止（或切了会话），不是失败，不能显示成"出错了"。
+    if (error.name === 'AbortError') {
+      console.log('⏹️ 已停止生成')
+    } else {
+      console.error('❌ 发送失败:', error)
+      aiMessage.content = `抱歉，出错了: ${error.message || '请重试'}`
+    }
+  } finally {
+    // 正常结束、出错、被取消三条路径都要收尾，否则按钮会永远停在「停止」上。
+    // 但只在"这一轮还是当前这一轮"时回收全局状态：用户点了停止又立刻发下一条，
+    // 旧请求的 finally 晚到时不能把新一轮的按钮改回发送键。
+    if (activeController === controller) {
+      activeController = null
+      isGenerating.value = false
+    }
     isLoading.value = false
+    stopDisplayTimer()
+    aiMessage.isProcessing = false
+    aiMessage.isThinking = false
+    const idx = aiMsgIndex(aiMessage)
+    if (idx >= 0) {
+      messages.value[idx].content = aiMessage.content
+      messages.value[idx].isProcessing = false
+      messages.value[idx].isThinking = false
+    }
+  }
+}
+
+// ===== HITL：确认卡上的按钮 =====
+// action: 'confirm' 就这样 / 'cancel' 算了 / 'edit' 改完参数再规划
+// edits 只在 edit 时传，直接是确认卡上的载荷（模板里 v-model 绑的就是它）
+const resolveInterrupt = async (msg, action, edits = null) => {
+  if (!msg || !msg.interrupt || isGenerating.value) return
+
+  const threadId = props.threadId || currentThreadId.value
+  if (!threadId) return
+
+  const payload = {action}
+  if (action === 'edit' && edits) {
+    const dest = (edits.destination || '').trim()
+    if (dest) payload.destination = dest
+    const days = parseInt(edits.days, 10)
+    if (Number.isFinite(days) && days > 0) payload.days = days
+    const budget = parseInt(edits.budget, 10)
+    if (Number.isFinite(budget) && budget > 0) payload.budget = budget
+  }
+
+  const controller = new AbortController()
+  activeController = controller
+  isGenerating.value = true
+  isLoading.value = true
+
+  // 卡片立刻收掉：按钮只该点一次，网络慢的时候用户很容易连点，
+  // 而后端对"没有 pending 中断"会返回 409。
+  msg.interrupt = null
+  msg.interruptEditing = false
+  msg.isProcessing = true
+
+  try {
+    const response = await api.resumeChat(threadId, payload, {signal: controller.signal})
+    await consumeStream(response, msg, threadId, controller)
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.log('⏹️ 已取消确认')
+    } else {
+      console.error('❌ 确认失败:', error)
+      msg.content = `确认失败: ${error.message || '请重试'}`
+    }
+  } finally {
+    if (activeController === controller) {
+      activeController = null
+      isGenerating.value = false
+    }
+    isLoading.value = false
+    stopDisplayTimer()
+    const idx = aiMsgIndex(msg)
+    if (idx >= 0) {
+      messages.value[idx].isProcessing = false
+      messages.value[idx].isThinking = false
+    }
   }
 }
 
@@ -1178,7 +1445,10 @@ defineExpose({
 })
 
 // ===== 监听 threadId 变化 =====
-watch(() => props.threadId, (newId) => {
+watch(() => props.threadId, (newId, oldId) => {
+  // 切会话第一件事是掐断上一轮的流。否则旧流会继续读到 done，而 messages.value
+  // 这时已经换成新会话的消息了（用户看到的"串台"就是这么来的）。
+  if (newId !== oldId) abortStream()
   if (newId) {
     currentThreadId.value = newId
     loadSessionMessagesFromDB(newId)
@@ -1201,6 +1471,8 @@ onMounted(() => {
 // ===== 在组件卸载时清理定时器 =====
 onUnmounted(() => {
   stopDisplayTimer()
+  // 离开页面就别让请求接着跑：后端会照常生成完、照常烧 token，而结果没人看
+  abortStream()
   messagesWrapper.value?.removeEventListener('scroll', onMessagesScroll)
   window.removeEventListener('resize', measureRail)
 })
@@ -1744,6 +2016,146 @@ onUnmounted(() => {
   overflow-wrap: break-word;
 }
 
+/* ===== HITL 确认卡 ===== */
+.confirm-card {
+  margin-top: 10px;
+  padding: 14px 16px 13px;
+  border-radius: 14px;
+  background: #fff;
+  border: 1px solid #e6e9f2;
+  box-shadow: 0 6px 20px rgba(31, 45, 94, 0.07);
+  max-width: 520px;
+}
+
+.confirm-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #2b3245;
+  margin-bottom: 11px;
+}
+
+/* 小圆点带一圈光晕，和侧边栏 active 的强调色保持一套 */
+.confirm-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #5b78ff, #4f6ef7);
+  box-shadow: 0 0 0 3px rgba(79, 110, 247, 0.14);
+}
+
+.confirm-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.confirm-row {
+  display: flex;
+  gap: 10px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.confirm-label {
+  flex: 0 0 52px;
+  color: #9aa2b1;
+}
+
+.confirm-value {
+  color: #2b3245;
+  font-weight: 500;
+  word-break: break-word;
+}
+
+.confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 13px;
+}
+
+.confirm-btn {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 9px;
+  border: 1px solid #e2e6ef;
+  background: #f7f8fc;
+  color: #46506a;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: all 0.16s ease;
+}
+
+.confirm-btn:hover {
+  background: #eef1f9;
+  border-color: #d5dbeb;
+}
+
+.confirm-btn.primary {
+  border-color: transparent;
+  background: linear-gradient(135deg, #5b78ff, #4f6ef7);
+  color: #fff;
+  font-weight: 500;
+  box-shadow: 0 6px 16px rgba(79, 110, 247, 0.28);
+}
+
+.confirm-btn.primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(79, 110, 247, 0.34);
+}
+
+.confirm-btn.ghost {
+  background: transparent;
+  border-color: transparent;
+  color: #9aa2b1;
+}
+
+.confirm-btn.ghost:hover {
+  background: #f2f4fa;
+  color: #6b7386;
+}
+
+/* 编辑态表单 */
+.confirm-form {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.confirm-form label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.confirm-form label > span {
+  flex: 0 0 52px;
+  font-size: 12.5px;
+  color: #9aa2b1;
+}
+
+.confirm-form input {
+  flex: 1;
+  height: 32px;
+  padding: 0 10px;
+  border-radius: 8px;
+  border: 1px solid #e2e6ef;
+  background: #fafbff;
+  font-size: 13px;
+  color: #2b3245;
+  outline: none;
+  transition: border-color 0.16s ease, box-shadow 0.16s ease;
+}
+
+.confirm-form input:focus {
+  border-color: #b9c6f8;
+  box-shadow: 0 0 0 3px rgba(79, 110, 247, 0.1);
+  background: #fff;
+}
+
 .message-bubble {
   padding: 13px 17px;
   border-radius: 16px;
@@ -1955,6 +2367,18 @@ onUnmounted(() => {
 .send-btn:disabled {
   cursor: not-allowed;
   opacity: 0.6;
+}
+
+/* 停止按钮：深色实心，和蓝色的发送键区分开，避免"以为点了发送" */
+.stop-btn {
+  background: #24282f;
+  color: #fff;
+  box-shadow: 0 6px 16px rgba(36, 40, 47, 0.22);
+}
+
+.stop-btn:hover {
+  transform: scale(1.06);
+  background: #33383f;
 }
 
 /* 底部提示文字 */

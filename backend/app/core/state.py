@@ -73,6 +73,14 @@ class TripState(TypedDict):
     missing_fields: List[str]
     # clarify 节点要追问的话术（模板生成，不调 LLM）
     clarify_question: Optional[str]
+
+    # ===== HITL：提交规划前的人工确认 =====
+    # need_confirm：这一轮要不要在扇出检索之前停下来问用户一句。
+    #   本轮明确给了目的地（可能是新需求/换城市）、或刚接完 clarify 追问 → 要停；
+    #   纯粹改天数/预算（"改成5天"）→ 不打断，否则每次微调都要点一下确认。
+    need_confirm: NotRequired[bool]
+    # confirmed：confirm_needs 的结论。False 表示用户在确认卡上点了"算了"。
+    confirmed: NotRequired[bool]
     # 顺序节点（format_input / generate_plan）的失败原因
     error: Optional[str]
     # 三个并行节点的失败原因必须各用一个键：它们在同一 superstep 里执行，

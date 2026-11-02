@@ -12,6 +12,7 @@ from app.core.state import TripState, IntentOutput
 from app.config import settings
 from app.rag.retriever import *
 from langgraph.graph import END
+from langgraph.types import interrupt
 from app.mcp.client import getAllTools
 
 #
@@ -291,6 +292,14 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
     )
     state["clarify_question"] = None
 
+    # 要不要在检索之前停下来跟用户确认一次（HITL）？
+    # 只在"这轮给了新目的地"或"刚补完 clarify 的追问"时才停：前者可能把城市听错，
+    # 后者是用户刚说完关键信息、最该让他确认一眼。
+    # "改成5天""预算加到8000"这类纯参数调整不打断，否则每次微调都要多点一下。
+    state["need_confirm"] = bool(not state["missing_fields"]) and (
+        dest_explicit or continuing_clarify
+    )
+
     # dest = state["destination"]
     # days = state["days"]
     # budget = state["budget"]
@@ -357,13 +366,86 @@ async def clarify(state: TripState) -> TripState:
 
 
 def route_after_format(state: TripState):
-    """format_input 之后的路由：缺关键槽位就短路到 clarify，否则并行扇出。
+    """format_input 之后的路由：缺关键槽位就短路到 clarify，齐全则去人工确认。
 
-    条件边返回 list 就是动态 fan-out，和原来三条静态 add_edge 等价，
-    只是多了一个"不满足条件时改走 clarify"的分支。
+    确认之后才真正扇出三个检索节点（见 route_after_confirm）。
     """
     if state.get("missing_fields"):
         return ["clarify"]
+    return ["confirm_needs"]
+
+
+async def confirm_needs(state: TripState) -> dict:
+    """HITL 中断点：把抽好的槽位摆给用户过一眼，再决定要不要花钱花时间去规划。
+
+    为什么单独做成一个节点、而不是接在 format_input 末尾：
+    LangGraph 恢复中断时会把整个节点**从头重跑一遍**（这次 interrupt() 直接返回
+    resume 值）。如果塞进 format_input，用户每点一次"确认"就得多跑一次那个 LLM
+    槽位抽取，既费 token 又可能抽出跟上次不一样的结果。这个节点只读 state 和
+    调 interrupt，重跑成本接近零。
+    """
+    if not state.get("need_confirm"):
+        return {"confirmed": True, "current_step": "auto_confirmed"}
+
+    payload = interrupt({
+        "type": "confirm_needs",
+        "destination": state.get("destination") or "",
+        "days": state.get("days"),
+        "budget": state.get("budget"),
+        "preferences": state.get("preferences") or [],
+    })
+
+    # 前端约定三种回复：{"action":"confirm"} / {"action":"cancel"} /
+    #                    {"action":"edit", destination?, days?, budget?, preferences?}
+    action = (payload or {}).get("action") or "confirm"
+
+    if action == "cancel":
+        return {
+            "confirmed": False,
+            "current_step": "cancelled",
+            "response": "好的，这次先不规划。想改哪个条件直接告诉我就行。",
+        }
+
+    update: Dict[str, Any] = {"confirmed": True, "current_step": "confirmed"}
+
+    if action == "edit":
+        # 只认这几个字段：payload 是前端传进来的，不能让任意键落进 state
+        dest = (payload.get("destination") or "").strip()
+        if dest and dest != state.get("destination"):
+            update["destination"] = dest
+        days = _as_number(payload.get("days"))
+        if days:
+            update["days"] = int(days)
+        budget = _as_number(payload.get("budget"))
+        if budget:
+            update["budget"] = budget
+        prefs = payload.get("preferences")
+        if isinstance(prefs, list):
+            cleaned = [str(p).strip() for p in prefs if str(p).strip()]
+            if cleaned:
+                update["preferences"] = cleaned
+
+    return update
+
+
+async def cancelled(state: TripState) -> dict:
+    """用户放弃规划。
+
+    单独一个节点只是为了把 response 变成"节点自己的输出"，让 SSE 层能像处理
+    clarify 那样补发一条 message。confirm_needs 同时承担确认逻辑，把话术混在
+    它的输出里不好判断该不该发。
+    """
+    return {"response": state.get("response") or "好的，这次先不规划。"}
+
+
+def route_after_confirm(state: TripState):
+    """确认之后的分流：同意就扇出三个检索节点，放弃就收尾。
+
+    两种分支都返回 list：混着返回 END 和 list 在条件边里不好读，也不方便以后
+    再加分支（比如"只调整某一天"）。
+    """
+    if not state.get("confirmed"):
+        return ["cancelled"]
     return ["retrieve_guides", "search_attractions", "get_weather"]
 
 

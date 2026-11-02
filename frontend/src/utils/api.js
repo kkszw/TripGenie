@@ -157,7 +157,9 @@ export const api = {
     },
 
     // 发送消息（流式）
-    sendMessage: async function (threadId, message) {
+    // options.signal：AbortSignal，用于「停止生成」和切换会话时掐断请求。
+    // 不传 signal 时行为与原来完全一致，fetch 默认没有超时/取消。
+    sendMessage: async function (threadId, message, options = {}) {
         const body = {
             thread_id: threadId,
             message: message,
@@ -167,7 +169,8 @@ export const api = {
         const response = await fetch(`${API_BASE}/api/chat/stream`, {
             method: 'POST',
             headers: authHeaders({'Content-Type': 'application/json'}),
-            body: JSON.stringify(body)
+            body: JSON.stringify(body),
+            signal: options.signal
         });
 
         if (!response.ok) {
@@ -176,6 +179,36 @@ export const api = {
         }
 
         return response;
+    },
+
+    // HITL：把确认卡上的决定送回图里，从 checkpoint 原地恢复
+    // payload 形如 {action:'confirm'} / {action:'cancel'} / {action:'edit', days:5}
+    resumeChat: async function (threadId, payload, options = {}) {
+        const response = await fetch(`${API_BASE}/api/chat/resume`, {
+            method: 'POST',
+            headers: authHeaders({'Content-Type': 'application/json'}),
+            body: JSON.stringify({thread_id: threadId, payload}),
+            signal: options.signal
+        });
+        if (!response.ok) {
+            onUnauthorized(response);
+            throw await toError(response, '确认失败');
+        }
+        return response;
+    },
+
+    // 会话里有没有待确认的中断。刷新页面 / 切回会话后靠它把确认卡找回来。
+    // 查询失败不该打断界面，所以这里吞掉异常返回 null。
+    getPending: async function (threadId) {
+        try {
+            const response = await fetch(`${API_BASE}/api/chat/pending/${threadId}`, {
+                headers: authHeaders()
+            });
+            if (!response.ok) return {pending: null};
+            return await response.json();
+        } catch (e) {
+            return {pending: null};
+        }
     }
 };
 

@@ -20,6 +20,9 @@ async def create_workflow():
     workflow.add_node("tool_node", tool_node)
     workflow.add_node("format_input", format_input)
     workflow.add_node("clarify", clarify)
+    # HITL 中断点 + 用户放弃后的收尾节点
+    workflow.add_node("confirm_needs", confirm_needs)
+    workflow.add_node("cancelled", cancelled)
     workflow.add_node("get_weather", get_weather_node)
     workflow.add_node("retrieve_guides", retrieve_guides)
     workflow.add_node("search_attractions", search_attractions_node)
@@ -33,10 +36,15 @@ async def create_workflow():
     workflow.add_edge("tool_node", END)
 
     # format_input 之后先判断槽位是否齐全：缺目的地/天数就短路到 clarify，
-    # 齐全才并行扇出三个检索节点。条件边返回 list 即为动态 fan-out，
-    # 与原来三条静态 add_edge 等价，只是多了一条"先问清楚"的分支。
+    # 齐全则先经过 confirm_needs 停下来让用户确认（HITL），确认后才并行扇出。
+    # 条件边返回 list 即为动态 fan-out，与原来三条静态 add_edge 等价。
     workflow.add_conditional_edges("format_input", route_after_format)
     workflow.add_edge("clarify", END)
+
+    # 确认之后才真正开始检索。中断点在 confirm_needs 内部，
+    # 恢复依赖 compile(checkpointer=...) —— 没有 checkpointer 时 interrupt 会直接报错。
+    workflow.add_conditional_edges("confirm_needs", route_after_confirm)
+    workflow.add_edge("cancelled", END)
 
     workflow.add_edge("retrieve_guides", "generate_plan")
     workflow.add_edge("search_attractions", "generate_plan")
