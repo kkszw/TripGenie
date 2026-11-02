@@ -73,6 +73,15 @@ MCP 工具与自研工具（RAG 检索、天气查询）合并成统一工具集
 - **业务侧存储**：另建 SQLite 的 `sessions` / `messages` 表管理会话列表（含索引、级联删除、按首条用户消息自动生成会话名）
 - **历史回放**：行程产生的地图数据以 JSON 存进消息表，重新打开历史会话时地图能原样恢复
 
+### 7. 账号体系与数据隔离
+
+- **登录门禁**：未登录时前端直接弹登录窗（遮罩 + 卡片，不可关闭），登录后才能发消息；令牌有效则刷新页面仍保持登录
+- **密码存储**：`sha256` 预摘要后走 `bcrypt`（规避 bcrypt 的 72 字节上限），库里只有哈希
+- **令牌**：JWT（HS256，默认 7 天），放 `localStorage`，前端所有请求统一注入 `Authorization: Bearer <token>`
+- **会话隔离**：`sessions.user_id` 存真实用户 ID；列表只查自己的；读/改/删会话时校验归属，不是自己的**统一返回 404**（不是 403——403 会暴露"这个 thread_id 存在"）
+- **越权防护**：`/api/chat/stream` 若收到别人的 `thread_id` 返回 403，无法借会话 ID 往别人对话里写消息
+- **自动续期**：任意接口返回 401 → 清本地令牌 → 广播 `auth:expired` → 自动重新弹出登录窗
+
 ---
 
 ## 系统架构
@@ -105,8 +114,8 @@ flowchart TD
 |---|---|
 | Agent 编排 | LangGraph（StateGraph / 条件边 / 并行扇出 / Checkpointer） |
 | 工具协议 | MCP（`langchain-mcp-adapters`，stdio transport） |
-| 大模型 | 通义千问 / 阿里云百炼兼容模式；`with_structured_output` 做意图分类 |
-| RAG | Chroma 向量库、DashScope 向量模型、Markdown 按标题层级分块 |
+| 大模型 | DeepSeek（`deepseek-flash`，通过 OpenAI 兼容端点接入）；`with_structured_output` 做意图分类 |
+| RAG | Chroma 向量库、`qwen3.7-text-embedding-flash`（百炼 OpenAI 兼容模式，1024 维）、Markdown 按标题层级分块 |
 | 后端 | Python 3.12+、FastAPI、SSE、asyncio |
 | 存储 | SQLite（业务库 + LangGraph 检查点） |
 | 前端 | Vue 3（Composition API）、Vite、原生 ReadableStream 解析 SSE、高德地图 JS API |
@@ -124,12 +133,14 @@ TripGenie/
 │       ├── main.py                  # FastAPI 应用、CORS、路由注册
 │       ├── config.py                # 配置（统一读 .env）
 │       ├── api/
-│       │   ├── chat.py              # SSE 流式对话接口
-│       │   └── history.py           # 会话 / 消息接口
+│       │   ├── auth.py               # 注册 / 登录 / 当前用户
+│       │   ├── chat.py               # SSE 流式对话接口
+│       │   └── history.py            # 会话 / 消息接口（按登录用户隔离）
 │       ├── core/
 │       │   ├── langgraph_app.py     # 工作流图定义
 │       │   ├── agents.py            # 各节点实现 + 地图数据生成
 │       │   ├── state.py             # TripState 状态定义
+│       │   ├── security.py          # 密码哈希、JWT、当前用户依赖
 │       │   ├── tools.py             # 自研工具（RAG 检索、天气）
 │       │   └── checkpointer.py      # LangGraph SQLite 检查点
 │       ├── mcp/
@@ -142,11 +153,12 @@ TripGenie/
     ├── index.html
     ├── vite.config.js               # 含 /api 反向代理
     └── src/
-        ├── App.vue                  # 侧边栏 + 主区域布局
+        ├── App.vue                  # 侧边栏 + 主区域布局 + 登录门禁
         ├── views/ChatView.vue       # 对话主界面（SSE 解析、思考链）
         ├── components/chat/         # 行程卡片、详情弹窗、每日地图、思考链
-        ├── composables/useSessions.js
-        └── utils/api.js
+        ├── components/auth/         # 登录 / 注册弹窗
+        ├── composables/             # useSessions / useAuth（均为模块级单例）
+        └── utils/api.js             # 统一注入 Bearer 令牌、401 处理
 ```
 
 ---
@@ -158,7 +170,8 @@ TripGenie/
 - **Python >= 3.12**
 - **Node.js >= 18**
 - **uvx**（用于拉起 MCP Server）：`pip install uv`
-- 一个阿里云百炼 API Key（[控制台](https://bailian.console.aliyun.com/)）
+- 一个 DeepSeek API Key（[控制台](https://platform.deepseek.com/api_keys)）
+- 一个阿里云百炼 API Key（**仅用于 RAG 向量化**，DeepSeek 不提供 embedding 接口）
 - 两个高德地图 Key（[控制台](https://console.amap.com/dev/key/app)）：
   - **Web 端（JS API）** Key —— 前端渲染地图用，记得把 `localhost` 加进域名白名单
   - **Web 服务** Key —— 后端透传给 MCP，用于地理编码和路径规划
@@ -171,6 +184,9 @@ cd TripGenie
 pip install -r requirements.txt
 ```
 
+> ⚠️ `requirements.txt` 目前还是空文件（待冻结）。如果沿用你现有的虚拟环境，切到 DeepSeek 后需要补装对话模型适配包：
+> `pip install "langchain-openai>=0.2.0"`
+
 ### 2. 配置环境变量
 
 ```bash
@@ -181,19 +197,36 @@ cp .env.example .env          # Windows: copy .env.example .env
 
 | 变量 | 说明 |
 |---|---|
-| `DASHSCOPE_API_KEY` | 百炼 API Key，对话与向量化共用 |
-| `DASHSCOPE_MODEL` | 对话模型名 |
-| `DASHSCOPE_EMBEDDINGS` | 向量模型名 |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key，对话模型用 |
+| `DEEPSEEK_BASE_URL` | 固定 `https://api.deepseek.com` |
+| `DEEPSEEK_MODEL` | `deepseek-flash`（默认）或 `deepseek-v4-pro` |
+| `DEEPSEEK_THINKING` | `disabled`（默认）/ `enabled`，见下方说明 |
+| `DASHSCOPE_API_KEY` | 百炼 API Key，**仅 RAG 向量化使用**（也可用 `EMBEDDING_API_KEY` 单独指定） |
+| `EMBEDDING_MODEL` | 向量模型，默认 `qwen3.7-text-embedding-flash` |
+| `EMBEDDING_DIMENSIONS` | 向量维度，可选 `256/512/768/1024`，默认 1024。改了必须重建向量库 |
+| `EMBEDDING_COLLECTION` | Chroma collection 名，带模型标识；换模型时同步改，避免新老向量混库 |
+| `EMBEDDING_BATCH_SIZE` | 单批文本条数，官方上限 20 |
+| `LLM_TIMEOUT` | 单次 LLM 调用超时秒数，默认 120 |
 | `AMAP_API_KEY` | 高德 **Web 服务** Key，会透传给 MCP Server |
 | `WEATHER_API_KEY` | 天气接口（可不填，天气节点失败不影响主流程） |
 | `UVX_PATH` | uvx 可执行文件路径。**留空则自动探测** PATH 与当前虚拟环境 |
+| `JWT_SECRET` | 登录令牌签名密钥。**必须固定一个随机串**，否则每次重启都会把所有人踢下线 |
+
+> 生成 `JWT_SECRET`：`python -c "import secrets; print(secrets.token_urlsafe(48))"`，粘进 `.env` 即可。留空也能启动，但服务会用临时密钥并在控制台打印告警。
+
+> **关于 `DEEPSEEK_THINKING`**：DeepSeek 的思考模式默认开启（effort=high）。本项目默认关闭，因为思考阶段 `content` 为空、前端 SSE 会长时间无输出，且带 `tools` 的请求要求回传 `reasoning_content`，而本项目的历史消息是从 SQLite 重建的纯文本，拿不到该字段。确实需要更强推理时再打开，并同步改造历史消息的存储方式。
 
 前端另有一份：
 
 ```bash
 cd frontend
-cp .env.example .env          # 填入 VITE_AMAP_JS_KEY（高德 Web 端 JS API Key）
+cp .env.example .env
+# 填入两个值：
+#   VITE_AMAP_JS_KEY       高德「Web端(JS API)」Key（不是 Web 服务的那个）
+#   VITE_AMAP_SECURITY_CODE 与之配对的安全密钥 securityJsCode（2021-12-02 后申请的 Key 必填）
 ```
+
+> 两者类型不通用：`AMAP_API_KEY`（后端，Web 服务）不能用于浏览器；`VITE_AMAP_JS_KEY`（Web端 JS API）不能用于后端接口。地图脚本由 `src/utils/amap.js` 动态加载，加载失败会在卡片里直接显示原因，不再只留一个灰块。
 
 ### 3. 启动后端
 
@@ -210,10 +243,13 @@ python run.py
 
 ```bash
 cd backend
-python -m app.rag.init_rag_database
+python -m app.rag.init_rag_database          # 清空旧库后重建（默认）
+python -m app.rag.init_rag_database --keep   # 保留旧库，追加写入
 ```
 
-会读取 `app/data/travel_guide/` 下的 Markdown 攻略，分块后写入 Chroma。
+会读取 `app/data/travel_guide/` 下的全部 Markdown 攻略，按标题层级分块后写入 Chroma。
+
+> **换了 embedding 模型或改了维度，必须重跑本脚本。** 不同模型产出的向量不在同一语义空间，混在一个 collection 里不会报错，只会让检索结果静默变差。默认行为就是整库重建，`--keep` 仅用于追加语料。
 
 ### 5. 启动前端
 
@@ -229,14 +265,19 @@ npm run dev
 
 ## API 接口
 
+除 `/api/auth/register`、`/api/auth/login`、`/health` 外，所有接口都需要请求头 `Authorization: Bearer <token>`。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| `POST` | `/api/auth/register` | 注册（用户名 + 密码），成功即返回令牌，不用再登录一次 |
+| `POST` | `/api/auth/login` | 登录，返回令牌与用户信息 |
+| `GET` | `/api/auth/me` | 用令牌换用户信息（前端刷新页面时校验令牌是否仍有效） |
 | `POST` | `/api/chat/stream` | 发送消息，**SSE 流式**返回 Agent 响应 |
-| `GET` | `/api/history/` | 获取会话列表（`?user_id=default`） |
-| `POST` | `/api/history/sessions` | 新建会话 |
-| `GET` | `/api/history/{thread_id}` | 获取会话详情及其全部消息 |
-| `PUT` | `/api/history/sessions/{thread_id}` | 重命名会话 |
-| `DELETE` | `/api/history/{thread_id}` | 删除会话（消息级联删除） |
+| `GET` | `/api/history/` | 获取**当前登录用户**的会话列表 |
+| `POST` | `/api/history/sessions` | 新建会话（归属取自令牌） |
+| `GET` | `/api/history/{thread_id}` | 获取会话详情及其全部消息（非本人返回 404） |
+| `PUT` | `/api/history/sessions/{thread_id}` | 重命名会话（非本人返回 404） |
+| `DELETE` | `/api/history/{thread_id}` | 删除会话（消息级联删除，非本人返回 404） |
 | `GET` | `/health` | 健康检查 |
 
 `/api/chat/stream` 请求体：
@@ -256,5 +297,6 @@ npm run dev
 - **RAG 知识库只有 1 篇示例攻略**，检索效果受限；加载器已支持 Markdown 层级分块与 PDF，扩充语料即可
 - **暂无自动化测试与 CI**，目前靠手工回归
 - **暂无容器化部署**
-- **无用户体系**，`user_id` 固定为 `default`，会话未做隔离
+- **账号体系是最小实现**：有注册/登录/令牌续期，但没有找回密码、改密、邮箱校验、限流（暴力破解防护），也没有管理员角色
+- **令牌存 `localStorage`**：本项目没有 `v-html`、没有第三方脚本，实际 XSS 风险低；若要更严格应改为 HttpOnly Cookie + CSRF token
 - **地图兜底坐标是全局配置**，理想做法是先解析目的地城市中心再作为回落点

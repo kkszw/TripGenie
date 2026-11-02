@@ -2,8 +2,6 @@
 from typing import List, Dict, Any
 from langchain_core.documents import Document
 from app.rag.vector_store import get_vector_store
-from app.rag.document_loader import load_multiple_pdfs
-from langchain_community.retrievers import BM25Retriever
 
 def format_retrieved_docs(docs: List[Document]) -> str:
     """格式化检索结果，用于 LLM 上下文"""

@@ -13,6 +13,23 @@ DISABLED_MCP_TOOLS = [
     "maps_weather",
 ]
 
+# amap-mcp-server 依赖的 mcp 1.8.x 会 `from pydantic._internal._typing_extra import eval_type_backport`，
+# 而该函数在 pydantic 2.14 被移除。uvx 默认解析到最新的 2.14.x，导致子进程启动即 ImportError，
+# 表现为「加载MCP工具失败」且地图类工具全部不可用。
+# 用 --with 把 pydantic 压回 2.13.x（该版本仍有此函数），只影响这个 uvx 隔离环境，不动主环境。
+_AMAP_PYDANTIC_PIN = "pydantic>=2.9,<2.14"
+
+# 子进程（amap-mcp-server）会把它的 stdout/stderr 直接继承到我们这一侧，
+# 于是 PyCharm 控制台里会看到红色的告警。这些都是 MCP 服务端自己的输出，与本项目无关：
+#   1) IncompleteFieldDefinitionWarning: pydantic 2.13 + pydantic-settings 2.16 组合下，
+#      它在解析 starlette 命令行配置的 lifespan 前向引用时发出的告警，纯噪音；
+#   2) "Processing request of type CallToolRequest" 是 mcp 1.8.x 的 logger.info（默认 INFO 级）。
+# 只在这两个子进程的环境里压掉，不影响主进程的日志与告警。
+_MCP_SUBPROCESS_ENV = {
+    "PYTHONWARNINGS": "ignore",
+    "FASTMCP_LOG_LEVEL": "ERROR",
+}
+
 
 def resolve_uvx_path() -> str:
     """定位 uvx 可执行文件：优先 .env 配置，其次 PATH，最后当前虚拟环境"""
@@ -40,7 +57,8 @@ async def getAllClientTools():
                 "args": [
                     "mcp-server-time",
                     "--local-timezone=Asia/Shanghai"
-                ]
+                ],
+                "env": dict(_MCP_SUBPROCESS_ENV),
             }
         }
     )
@@ -50,10 +68,13 @@ async def getAllClientTools():
                 "transport": "stdio",
                 "command": uvx_path,
                 "args": [
+                    "--with",
+                    _AMAP_PYDANTIC_PIN,
                     "amap-mcp-server"
                 ],
                 "env": {
                     "AMAP_MAPS_API_KEY": settings.amap_api_key,
+                    **_MCP_SUBPROCESS_ENV,
                 }
             }
         }

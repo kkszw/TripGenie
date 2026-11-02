@@ -1,0 +1,39 @@
+# TripGenie 后端依赖
+# 安装：pip install -r requirements.txt
+# 首次跑通后建议锁版本：pip freeze > requirements.lock.txt
+
+# ===== Web 框架 =====
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+pydantic>=2.7.0
+pydantic-settings>=2.3.0
+python-dotenv>=1.0.0
+
+# ===== LangChain / LangGraph =====
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-community>=0.3.0
+langchain-openai>=0.2.0
+langchain-text-splitters>=0.3.0
+langchain-chroma>=0.1.4
+langchain-mcp-adapters>=0.1.0
+langgraph>=0.2.0
+langgraph-checkpoint-sqlite>=2.0.0
+
+# ===== 向量库 =====
+chromadb>=0.5.0
+
+# ===== 存储 / 网络 =====
+aiosqlite>=0.20.0
+httpx>=0.27.0
+
+# ===== 登录认证 =====
+PyJWT>=2.8.0
+bcrypt>=4.1.0
+
+# ===== 文档解析 =====
+pypdf>=4.2.0
+typing-extensions>=4.12.0
+
+# ===== 可选：PDF 保留格式解析（含 torch，体积大，只在需要 docling 解析 PDF 时安装）=====
+# pip install docling

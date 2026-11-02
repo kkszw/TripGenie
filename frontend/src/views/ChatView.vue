@@ -1,17 +1,46 @@
 <!-- frontend/src/views/ChatView.vue -->
 <template>
-  <div class="chat-container">
+  <!-- 有缩略表时给内容区让出右侧空间，避免气泡被压住 -->
+  <div class="chat-container" :class="{ 'with-rail': showRail }">
     <!-- 顶部标题栏 -->
-    <header class="chat-header">
+    <header class="chat-header" :class="{ 'is-collapsed': sidebarCollapsed }">
       <div class="header-left">
-        <button class="menu-btn" @click="$emit('toggle-sidebar')" title="切换侧边栏">
+        <!-- 侧边栏收起后：左上角悬浮控制条（logo + 胶囊按钮组） -->
+        <div v-if="sidebarCollapsed" class="float-bar">
+          <span class="fb-logo">🧳</span>
+          <div class="fb-pill">
+            <button
+                class="fb-btn is-primary"
+                data-tip="打开边栏"
+                @click="$emit('toggle-sidebar')"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
+                <rect x="3" y="4" width="18" height="16" rx="3"/>
+                <path d="M9 4V20"/>
+              </svg>
+            </button>
+            <button
+                class="fb-btn"
+                data-tip="新建对话"
+                @click="$emit('new-chat')"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9">
+                <circle cx="12" cy="12" r="9"/>
+                <path d="M12 8.5V15.5M8.5 12H15.5" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <button v-show="!sidebarCollapsed" class="menu-btn" @click="$emit('toggle-sidebar')" title="切换侧边栏">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M3 12H21M3 6H21M3 18H21" stroke-linecap="round"/>
           </svg>
         </button>
         <span class="chat-title">{{ currentTitle }}</span>
       </div>
-      <div class="header-right">
+      <!-- 收起后「新建对话」在悬浮条里，右上角的重复入口先藏起来 -->
+      <div v-show="!sidebarCollapsed" class="header-right">
         <button class="header-btn" @click="$emit('new-chat')" title="新建对话 (Ctrl+N)">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M12 5V19M5 12H19" stroke-linecap="round"/>
@@ -35,7 +64,7 @@
                 v-for="example in quickExamples"
                 :key="example.label"
                 class="example-btn"
-                @click="sendMessage(example.text)"
+                @click="handleExample(example.text)"
             >
               <span class="example-icon">{{ example.icon }}</span>
               {{ example.label }}
@@ -49,7 +78,7 @@
           <div v-if="msg.role === 'assistant'" class="message-ai fade-in-up">
             <div class="avatar avatar-ai">🧳</div>
             <div class="message-content">
-              <div class="message-bubble bubble-ai">
+              <div class="message-bubble bubble-ai" :class="{ 'bubble-plain': !!msg.tripPlan }">
                 <!-- ✅ 紧凑的思考过程 -->
                 <div v-if="msg.thinkingSteps && msg.thinkingSteps.length > 0" class="thinking-chain">
                   <div class="thinking-chain-header" @click="toggleThinking(index)">
@@ -100,17 +129,16 @@
             </div>
           </div>
 
-          <!-- 用户消息 -->
-          <div v-else class="message-user fade-in-up">
+          <!-- 用户消息：气泡靠右，宽度随内容收缩；data-turn 供右侧缩略表定位 -->
+          <div v-else class="message-user fade-in-up" :data-turn="index">
             <div class="message-content">
-              <div class="message-bubble bubble-user">
-                {{ msg.content }}
-              </div>
+              <!-- 用 v-text 而非插值：气泡是 pre-wrap，插值会把模板缩进也渲染出来 -->
+              <div class="message-bubble bubble-user" v-text="msg.content"></div>
               <div class="message-time">
                 {{ formatTime(msg.timestamp) }}
               </div>
             </div>
-            <div class="avatar avatar-user">👤</div>
+            <div class="avatar avatar-user">{{ userLetter }}</div>
           </div>
         </div>
 
@@ -181,6 +209,32 @@
       </div>
     </div>
 
+    <!-- 右侧对话缩略表：常态是细刻度条，鼠标移上去展开成文字列表 -->
+    <nav
+        v-if="showRail"
+        class="conv-rail"
+        :class="{ 'is-scrollable': railScrollable, 'is-open': railOpen }"
+        aria-label="对话快速定位"
+        @mouseenter="railOpen = true"
+        @mouseleave="railOpen = false"
+        @focusin="railOpen = true"
+        @focusout="railOpen = false"
+    >
+      <div ref="railEl" class="rail-scroll">
+        <button
+            v-for="turn in turns"
+            :key="turn.index"
+            type="button"
+            class="rail-item"
+            :class="{ active: turn.index === activeTurn }"
+            :title="turn.text"
+            @click="jumpToTurn(turn.index)"
+        >
+          <span class="rail-text">{{ turn.text }}</span>
+        </button>
+      </div>
+    </nav>
+
   </div>
 </template>
 
@@ -188,6 +242,7 @@
 import {ref, computed, nextTick, onMounted, watch, onUnmounted} from 'vue'
 import {api} from '@/utils/api'
 import {useSessions} from "@/composables/useSessions.js";
+import {useAuth} from "@/composables/useAuth.js";
 import TripPlanCard from '@/components/chat/TripPlanCard.vue'
 import TripPlanModal from '@/components/chat/TripPlanModal.vue'
 
@@ -195,10 +250,23 @@ const props = defineProps({
   threadId: {
     type: String,
     default: null
+  },
+  // 侧边栏是否收起：收起时头部换成左上角悬浮控制条
+  sidebarCollapsed: {
+    type: Boolean,
+    default: false
   }
 })
 
-const emit = defineEmits(['new-chat', 'update-title', 'toggle-sidebar', 'thread-created'])
+const emit = defineEmits(['new-chat', 'update-title', 'toggle-sidebar', 'thread-created', 'require-login'])
+
+const {isLoggedIn, user} = useAuth()
+
+// 用户头像用用户名首字母，比通用 👤 更有辨识度
+const userLetter = computed(() => {
+  const name = user.value?.username || '我'
+  return name.slice(0, 1).toUpperCase()
+})
 
 // ===== 状态 =====
 const messages = ref([])
@@ -247,6 +315,104 @@ const currentTitle = computed(() => {
     return content
   }
   return '新对话'
+})
+
+// ===== 右侧对话缩略表 =====
+const railEl = ref(null)
+const activeTurn = ref(null)
+const railScrollable = ref(false)
+// 常态收缩成刻度条，鼠标移入才展开（键盘聚焦同样展开）
+const railOpen = ref(false)
+
+// 每条用户提问 = 一个缩略项；index 是它在 messages 里的下标，用来定位气泡
+const turns = computed(() =>
+  messages.value
+    .map((msg, index) => ({msg, index}))
+    .filter(({msg}) => msg.role === 'user' && (msg.content || '').trim())
+    .map(({msg, index}) => ({
+      index,
+      text: msg.content.replace(/\s+/g, ' ').trim()
+    }))
+)
+
+// 只有一轮提问时跳转没意义，至少两轮才显示
+const showRail = computed(() => turns.value.length >= 2)
+
+const findTurnEl = (index) =>
+  messagesWrapper.value?.querySelector(`[data-turn="${index}"]`) || null
+
+// 以消息区顶部往下 80px 为参考线，判断当前滚到哪一轮
+const updateActiveTurn = () => {
+  const wrap = messagesWrapper.value
+  if (!wrap || !turns.value.length) return
+  const line = wrap.getBoundingClientRect().top + 80
+  let current = turns.value[0].index
+  for (const turn of turns.value) {
+    const el = findTurnEl(turn.index)
+    if (!el) continue
+    if (el.getBoundingClientRect().top <= line) current = turn.index
+    else break
+  }
+  activeTurn.value = current
+}
+
+// 滚动事件按帧节流，避免高频 getBoundingClientRect
+let scrollTick = false
+const onMessagesScroll = () => {
+  if (scrollTick) return
+  scrollTick = true
+  requestAnimationFrame(() => {
+    scrollTick = false
+    updateActiveTurn()
+  })
+}
+
+// 内容不足一屏时不加淡出遮罩，避免首尾条目发灰
+const measureRail = () => {
+  const rail = railEl.value
+  railScrollable.value = !!rail && rail.scrollHeight > rail.clientHeight + 2
+}
+
+// 缩略表自身滚动，让当前项始终留在可视范围中间
+const syncRailScroll = () => {
+  const rail = railEl.value
+  if (!rail) return
+  measureRail()
+  const idx = turns.value.findIndex(t => t.index === activeTurn.value)
+  const item = idx >= 0 ? rail.children[idx] : null
+  if (!item) return
+  const target = item.offsetTop - rail.clientHeight / 2 + item.offsetHeight / 2
+  rail.scrollTo({top: Math.max(0, target), behavior: 'smooth'})
+}
+
+// 点击缩略项 → 平滑滚到对应提问
+const jumpToTurn = (index) => {
+  const wrap = messagesWrapper.value
+  const el = findTurnEl(index)
+  if (!wrap || !el) return
+
+  const top = el.getBoundingClientRect().top - wrap.getBoundingClientRect().top + wrap.scrollTop - 18
+  wrap.scrollTo({top: Math.max(0, top), behavior: 'smooth'})
+  activeTurn.value = index
+
+  // 目标气泡闪一下，跳过去不至于找不到落点
+  const bubble = el.querySelector('.bubble-user')
+  if (bubble) {
+    bubble.classList.add('is-jump')
+    setTimeout(() => bubble.classList.remove('is-jump'), 1200)
+  }
+}
+
+watch(activeTurn, () => nextTick(syncRailScroll))
+
+// 展开/收起时条目高度会变，重新把当前项滚到可视区
+watch(railOpen, () => nextTick(syncRailScroll))
+
+// 消息增减（流式回复、切换会话）后重算当前项
+watch(() => turns.value.length, async () => {
+  await nextTick()
+  updateActiveTurn()
+  measureRail()
 })
 
 // ===== 快捷示例 =====
@@ -585,6 +751,23 @@ const handleSSEEvent = (data, aiMessage) => {
       }, 100)
       break
 
+    case 'warning':
+      // 半失败：例如攻略检索挂了但行程照常生成。
+      // 只在思考链里把对应节点标红，不动正文、不中断流（'error' 那种替换正文的处理
+      // 用在这里会让用户以为整条消息失败了）。
+      console.warn('⚠️ SSE 警告:', data.node, data.message)
+      const warnNodeMap = {
+        'classify_input': '🔍 分析意图',
+        'format_input': '📋 提取需求',
+        'retrieve_guides': '📚 检索攻略',
+        'search_attractions': '🏛️ 搜索景点',
+        'get_weather': '🌤️ 获取天气',
+        'generate_plan': '📝 生成行程',
+        'chat': '💬 思考回复'
+      }
+      addThinkingStep(aiMessage, warnNodeMap[data.node] || data.node, data.message || '执行有异常', 'error')
+      break
+
     case 'error':
       console.error('❌ SSE 错误:', data.error || data.message)
       isLoading.value = false
@@ -720,10 +903,24 @@ const stopDisplayTimer = () => {
   }
 }
 
+// ===== 欢迎页快捷示例：填入输入框后复用 handleSend =====
+// 不要写成 @click="handleSend(example.text)"：handleSend 是无参函数，而 166 行的
+// 发送按钮是 @click="handleSend"，那样会把点击事件对象当成文本传进来。
+const handleExample = (text) => {
+  inputText.value = text
+  handleSend()
+}
+
 // ===== 发送消息 =====
 const handleSend = async () => {
   const text = inputText.value.trim()
   if (!text || isLoading.value) return
+
+  // 未登录不发请求：留住输入框里的文字，只唤起登录窗
+  if (!isLoggedIn.value) {
+    emit('require-login')
+    return
+  }
 
   displayBuffer.value = ''
   stopDisplayTimer()
@@ -987,10 +1184,18 @@ watch(() => props.threadId, (newId) => {
 // ===== 挂载时聚焦 =====
 onMounted(() => {
   focusInput()
+  nextTick(() => {
+    messagesWrapper.value?.addEventListener('scroll', onMessagesScroll, {passive: true})
+    updateActiveTurn()
+    measureRail()
+  })
+  window.addEventListener('resize', measureRail)
 })
 // ===== 在组件卸载时清理定时器 =====
 onUnmounted(() => {
   stopDisplayTimer()
+  messagesWrapper.value?.removeEventListener('scroll', onMessagesScroll)
+  window.removeEventListener('resize', measureRail)
 })
 </script>
 
@@ -1003,6 +1208,17 @@ onUnmounted(() => {
   background: #ffffff;
   position: relative;
   overflow: hidden;
+  /* 右侧缩略条占的宽度（26 的刻度条 + 两侧留白） */
+  --rail-space: 36px;
+}
+
+/* 有缩略条时：消息区和输入框一起向左让 36px，避免刻度条压到气泡右边缘 */
+.chat-container.with-rail .messages-wrapper {
+  padding-right: var(--rail-space);
+}
+
+.chat-container.with-rail .input-wrapper {
+  right: calc(var(--rail-space) + 10px);
 }
 
 /* ===== 头部 ===== */
@@ -1010,18 +1226,19 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 12px 20px;
-  border-bottom: 1px solid #e5e7eb;
+  padding: 10px 20px;
+  border-bottom: 1px solid #eef0f4;
   flex-shrink: 0;
   background: #ffffff;
   z-index: 5;
-  min-height: 50px;
+  min-height: 58px;
 }
 
 .header-left {
   display: flex;
   align-items: center;
   gap: 12px;
+  min-width: 0;
 }
 
 .menu-btn {
@@ -1041,24 +1258,119 @@ onUnmounted(() => {
 
 .chat-title {
   font-size: 15px;
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: -0.01em;
   color: #1a1a1a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* ===== 侧边栏收起后的左上角控制条 ===== */
+.chat-header.is-collapsed {
+  padding-left: 14px;
+}
+
+.float-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+
+.fb-logo {
+  font-size: 22px;
+  line-height: 1;
+  user-select: none;
+}
+
+.fb-pill {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  background: #ffffff;
+  border: 1px solid #e8ebf2;
+  border-radius: 999px;
+  box-shadow: 0 2px 10px rgba(23, 32, 60, 0.07);
+}
+
+.fb-btn {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  padding: 0;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: #262b33;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+/* 「打开边栏」是主操作，常驻一层浅色底，和参考图一致 */
+.fb-btn.is-primary {
+  background: #f1f3f7;
+}
+
+.fb-btn:hover {
+  background: #eceff5;
+}
+
+.fb-btn.is-primary:hover {
+  background: #e5eaf2;
+  color: #4f6ef7;
+}
+
+/* 深色气泡提示 */
+.fb-btn[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  top: calc(100% + 9px);
+  left: 50%;
+  padding: 6px 10px;
+  border-radius: 7px;
+  background: #24282f;
+  color: #ffffff;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.2;
+  letter-spacing: 0;
+  white-space: nowrap;
+  transform: translate(-50%, -3px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.14s ease, transform 0.14s ease;
+  z-index: 40;
+}
+
+.fb-btn[data-tip]:hover::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
 }
 
 .header-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
   background: none;
   border: none;
-  padding: 6px 10px;
+  padding: 0;
   cursor: pointer;
   color: #6b7280;
-  border-radius: 6px;
-  transition: all 0.2s ease;
-  font-size: 13px;
+  border-radius: 9px;
+  transition: all 0.18s ease;
 }
 
 .header-btn:hover {
-  background: #f7f8fa;
-  color: #1a1a1a;
+  background: #f1f3f9;
+  color: #4f6ef7;
 }
 
 /* ===== 消息区域 ===== */
@@ -1066,7 +1378,7 @@ onUnmounted(() => {
   flex: 1;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: 16px 0 20px;
+  padding: 24px 0 24px;
   background: #f7f8fa;
   min-height: 0;
   scroll-behavior: smooth;
@@ -1096,9 +1408,180 @@ onUnmounted(() => {
 }
 
 .messages-container {
-  max-width: 860px;
+  max-width: 820px;
   margin: 0 auto;
-  padding: 0 24px 140px;
+  padding: 0 24px 150px;
+}
+
+/* ===== 右侧对话缩略表（常态为细刻度条，悬停展开） ===== */
+.conv-rail {
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  transform: translateY(-50%);
+  z-index: 8;
+  display: flex;
+  width: 26px;
+  max-height: calc(100% - 190px);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 16px;
+  box-shadow: none;
+  overflow: hidden;
+  transition: width 0.22s ease, background 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease;
+}
+
+.conv-rail.is-open {
+  width: 214px;
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-color: #e9ecf3;
+  box-shadow: 0 14px 36px rgba(23, 32, 60, 0.12);
+}
+
+.rail-scroll {
+  position: relative; /* 作为 item.offsetTop 的基准 */
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 0;
+  scrollbar-width: none;
+}
+
+.conv-rail.is-open .rail-scroll {
+  padding: 10px 8px;
+}
+
+/* 只有内容超出一屏才做上下淡出，暗示还能滚 */
+.conv-rail.is-scrollable .rail-scroll {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 14px, #000 calc(100% - 14px), transparent 100%);
+}
+
+.rail-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.rail-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-shrink: 0;
+  width: 100%;
+  height: 14px;
+  padding: 0 7px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: #98a1b3;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: right;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+/* 收起态：每条提问显示成一根小横线，当前那条加粗变深 */
+.rail-item::before {
+  content: '';
+  width: 12px;
+  height: 2px;
+  border-radius: 2px;
+  background: #d5dae3;
+  transition: background 0.15s ease, width 0.15s ease;
+}
+
+.rail-item:hover::before {
+  background: #9aa3b5;
+}
+
+.rail-item.active::before {
+  width: 14px;
+  background: #24282f;
+}
+
+.rail-text {
+  display: none;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== 展开态 ===== */
+.conv-rail.is-open .rail-item {
+  height: auto;
+  /* 右侧多留 10px，给 active 的小竖条让出位置 */
+  padding: 7px 16px 7px 10px;
+}
+
+.conv-rail.is-open .rail-item::before {
+  display: none;
+}
+
+.conv-rail.is-open .rail-text {
+  display: block;
+  /* 等宽度动画走完再淡入，避免文字在展开过程中被挤成一团 */
+  animation: railTextIn 0.12s ease 0.12s both;
+}
+
+.conv-rail.is-open .rail-item:hover {
+  background: rgba(79, 110, 247, 0.06);
+  color: #1f2937;
+}
+
+.conv-rail.is-open .rail-item.active {
+  background: #ffffff;
+  color: #111827;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(23, 32, 60, 0.07), inset 0 0 0 1px #e6eaf3;
+}
+
+/* 当前项右侧的小竖条，和截图里的标记一致 */
+.conv-rail.is-open .rail-item.active::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  right: 6px;
+  width: 2px;
+  height: 12px;
+  border-radius: 2px;
+  background: #4f6ef7;
+  transform: translateY(-50%);
+}
+
+@keyframes railTextIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* 跳转后目标气泡闪一下 */
+.bubble-user.is-jump {
+  animation: jumpFlash 1.2s ease;
+}
+
+@keyframes jumpFlash {
+  0% {
+    box-shadow: 0 0 0 0 rgba(79, 110, 247, 0.5);
+  }
+  35% {
+    box-shadow: 0 0 0 6px rgba(79, 110, 247, 0.14);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(79, 110, 247, 0);
+  }
 }
 
 /* ===== 欢迎界面 ===== */
@@ -1107,28 +1590,39 @@ onUnmounted(() => {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  min-height: 400px;
+  /* 让空状态在可视区内垂直居中，同时给底部输入框留出空间 */
+  min-height: calc(100vh - 330px);
   text-align: center;
-  padding: 40px 20px;
+  padding: 24px 20px;
 }
 
 .welcome-icon {
-  font-size: 64px;
-  margin-bottom: 24px;
-  animation: bounce 2s ease-in-out infinite;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 88px;
+  height: 88px;
+  margin-bottom: 22px;
+  border-radius: 26px;
+  font-size: 40px;
+  background: linear-gradient(135deg, #eef2ff 0%, #f4efff 100%);
+  border: 1px solid #e6eaff;
+  box-shadow: 0 12px 32px rgba(79, 110, 247, 0.12);
+  animation: bounce 3s ease-in-out infinite;
 }
 
 .welcome-title {
-  font-size: 28px;
+  font-size: 26px;
   font-weight: 600;
-  margin-bottom: 12px;
+  letter-spacing: -0.02em;
+  margin-bottom: 10px;
   background: linear-gradient(135deg, #4f6ef7, #7c3aed);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
 
 .welcome-subtitle {
-  font-size: 15px;
+  font-size: 14px;
   color: #6b7280;
   margin-bottom: 28px;
 }
@@ -1143,68 +1637,99 @@ onUnmounted(() => {
 .example-btn {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 18px;
+  gap: 10px;
+  padding: 10px 16px 10px 10px;
   background: #ffffff;
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
+  border: 1px solid #e8eaf1;
+  border-radius: 12px;
   color: #1a1a1a;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: all 0.18s ease;
   font-size: 13px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.03);
 }
 
 .example-btn:hover {
-  border-color: #4f6ef7;
-  box-shadow: 0 4px 12px rgba(79, 110, 247, 0.12);
+  border-color: #c7d2fe;
+  box-shadow: 0 8px 22px rgba(79, 110, 247, 0.12);
   transform: translateY(-2px);
 }
 
 .example-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  background: #f5f6ff;
   font-size: 16px;
+  flex-shrink: 0;
 }
 
 /* ===== 消息样式 ===== */
 .message-wrapper {
   display: flex;
-  margin-bottom: 20px;
+  margin-bottom: 26px;
 }
 
 .message-ai {
   display: flex;
-  gap: 14px;
+  gap: 12px;
   width: 100%;
+  align-items: flex-start;
 }
 
+/* 用户消息整体靠右：内容宽度由气泡撑开，不能再被 flex:1 拉满 */
 .message-user {
   display: flex;
-  gap: 14px;
+  gap: 12px;
   width: 100%;
   justify-content: flex-end;
+  align-items: flex-start;
 }
 
 .avatar {
-  width: 32px;
-  height: 32px;
-  border-radius: 50%;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 16px;
+  font-weight: 600;
   flex-shrink: 0;
+  user-select: none;
 }
 
 .avatar-ai {
-  background: #eef2ff;
+  background: linear-gradient(135deg, #eef2ff, #e7ecff);
+  border: 1px solid #e2e8ff;
 }
 
 .avatar-user {
-  background: #e5e7eb;
+  background: linear-gradient(135deg, #5b78ff, #7c3aed);
+  color: #ffffff;
+  font-size: 13px;
+  box-shadow: 0 4px 12px rgba(79, 110, 247, 0.26);
 }
 
-.message-content {
+/* AI 内容吃满剩余宽度；用户内容按气泡自身宽度收缩 */
+.message-ai .message-content {
   flex: 1;
-  max-width: 85%;
+  min-width: 0;
+  max-width: 100%;
+  padding-top: 2px;
+}
+
+.message-user .message-content {
+  flex: 0 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  max-width: min(72%, 560px);
+  min-width: 0;
+  padding-top: 2px;
 }
 
 .message-text {
@@ -1213,31 +1738,51 @@ onUnmounted(() => {
 }
 
 .message-bubble {
-  padding: 14px 18px;
-  border-radius: 18px;
+  padding: 13px 17px;
+  border-radius: 16px;
   font-size: 14px;
-  line-height: 1.7;
+  line-height: 1.72;
+  word-break: break-word;
 }
 
 .bubble-ai {
-  background: #f0f0f0;
+  background: #ffffff;
   color: #1a1a1a;
-  border-bottom-left-radius: 4px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  border: 1px solid #eceef3;
+  border-bottom-left-radius: 6px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+/* 纯文本回复按内容收缩，短句不再拉成一整条白板 */
+.message-ai .bubble-ai:not(.bubble-plain) {
+  width: fit-content;
+  max-width: 100%;
+}
+
+/* 行程卡片自带版式：去掉气泡壳，避免白色描边把卡片再套一圈 */
+.bubble-plain {
+  padding: 0;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
 }
 
 .bubble-user {
-  background: #4f6ef7;
-  color: white;
-  border-bottom-right-radius: 4px;
+  max-width: 100%;
+  background: linear-gradient(135deg, #5b78ff 0%, #4f6ef7 100%);
+  color: #ffffff;
+  border-bottom-right-radius: 6px;
+  box-shadow: 0 6px 18px rgba(79, 110, 247, 0.22);
+  white-space: pre-wrap;
 }
 
 .message-time {
   font-size: 11px;
-  color: #9ca3af;
-  margin-top: 4px;
+  color: #aab0bd;
+  margin-top: 7px;
+  padding-right: 2px;
   text-align: right;
-  padding-right: 4px;
 }
 
 /* ===== 打字动画 ===== */
@@ -1303,26 +1848,26 @@ onUnmounted(() => {
   left: 10px;
   right: 10px;
   padding: 0 20px 12px;
-  background: linear-gradient(to top, #ffffff 80%, transparent);
+  background: linear-gradient(to top, #f7f8fa 78%, rgba(247, 248, 250, 0));
   z-index: 10;
   pointer-events: none;
 }
 
 .input-container {
-  max-width: 860px;
+  max-width: 820px;
   margin: 0 auto;
   pointer-events: auto;
   background: #ffffff;
-  border-radius: 16px;
-  border: 1.5px solid #e5e7eb;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
-  transition: all 0.25s ease;
-  padding: 6px 12px 6px 16px;
+  border-radius: 18px;
+  border: 1px solid #e6e8ef;
+  box-shadow: 0 8px 30px rgba(17, 24, 39, 0.07);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+  padding: 8px 12px 8px 16px;
 }
 
 .input-container:focus-within {
   border-color: #4f6ef7;
-  box-shadow: 0 4px 24px rgba(79, 110, 247, 0.15), 0 0 0 4px rgba(79, 110, 247, 0.06);
+  box-shadow: 0 8px 30px rgba(79, 110, 247, 0.14), 0 0 0 4px rgba(79, 110, 247, 0.10);
 }
 
 .input-inner {
@@ -1335,7 +1880,7 @@ onUnmounted(() => {
   width: 100%;
   border: none;
   background: transparent;
-  padding: 8px 0;
+  padding: 6px 0;
   font-size: 15px;
   line-height: 1.6;
   resize: none;
@@ -1343,7 +1888,7 @@ onUnmounted(() => {
   font-family: inherit;
   color: #1a1a1a;
   max-height: 200px;
-  min-height: 44px;
+  min-height: 40px;
 }
 
 .chat-input::placeholder {
@@ -1360,8 +1905,7 @@ onUnmounted(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 4px 0;
-  border-top: 1px solid #f3f4f6;
+  padding: 0 0 2px;
 }
 
 .toolbar-left {
@@ -1380,44 +1924,60 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  height: 32px;
+  width: 34px;
+  height: 34px;
   border: none;
   border-radius: 50%;
-  background: #e5e7eb;
-  color: #9ca3af;
+  background: #eef0f5;
+  color: #a8afbd;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: all 0.18s ease;
 }
 
 .send-btn.active {
-  background: #4f6ef7;
+  background: linear-gradient(135deg, #5b78ff, #4f6ef7);
   color: white;
+  box-shadow: 0 6px 16px rgba(79, 110, 247, 0.3);
 }
 
 .send-btn.active:hover {
-  background: #3b5de7;
-  transform: scale(1.05);
+  transform: scale(1.06);
+  box-shadow: 0 8px 20px rgba(79, 110, 247, 0.36);
 }
 
 .send-btn:disabled {
   cursor: not-allowed;
-  opacity: 0.5;
+  opacity: 0.6;
 }
 
 /* 底部提示文字 */
 .input-footer {
   display: flex;
   justify-content: space-between;
-  max-width: 860px;
+  max-width: 820px;
   margin: 8px auto 0;
   font-size: 11px;
-  color: #9ca3af;
+  color: #b3b9c5;
   pointer-events: none;
-  padding: 0 4px;
+  padding: 0 6px;
 }
 
 /* ===== 响应式 ===== */
+/* 手机端空间太窄，收起缩略条（切换会话仍走左侧边栏） */
+@media (max-width: 768px) {
+  .conv-rail {
+    display: none;
+  }
+
+  .chat-container.with-rail .messages-wrapper {
+    padding-right: 0;
+  }
+
+  .chat-container.with-rail .input-wrapper {
+    right: 10px;
+  }
+}
+
 @media (max-width: 768px) {
   .menu-btn {
     display: block;
@@ -1427,8 +1987,23 @@ onUnmounted(() => {
     padding: 0 16px 120px;
   }
 
-  .message-content {
-    max-width: 92%;
+  .message-wrapper {
+    margin-bottom: 20px;
+  }
+
+  .message-user .message-content {
+    max-width: 82%;
+  }
+
+  .avatar {
+    width: 30px;
+    height: 30px;
+    border-radius: 9px;
+    font-size: 15px;
+  }
+
+  .avatar-user {
+    font-size: 12px;
   }
 
   .input-wrapper {
@@ -1436,7 +2011,8 @@ onUnmounted(() => {
   }
 
   .input-container {
-    padding: 4px 10px 4px 12px;
+    border-radius: 14px;
+    padding: 6px 10px 6px 12px;
   }
 
   .quick-examples {
@@ -1481,9 +2057,9 @@ onUnmounted(() => {
 /* ===== 紧凑的思考链 ===== */
 .thinking-chain {
   margin-bottom: 10px;
-  background: #f8f9fa;
-  border-radius: 8px;
-  border: 1px solid #e9ecef;
+  background: #f8f9fb;
+  border-radius: 10px;
+  border: 1px solid #eef0f6;
   overflow: hidden;
   font-size: 13px;
 }
