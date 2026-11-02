@@ -77,8 +77,10 @@
                   </div>
 
                   <!-- ✅ 当日地图（放在行程描述下方） -->
+                  <!-- 不再用「当天有景点」作为渲染条件：没有景点时交给 DayMap 自己显示空态，
+                       否则最后一天（自由活动/返程）会整块留白，看起来像地图挂了 -->
                   <DayMap
-                      v-if="currentIndex === index && getDayAttractions(day.day || index + 1).length > 0"
+                      v-if="currentIndex === index"
                       :key="`day-map-${index}-${currentIndex}`"
                       :day="day.day || index + 1"
                       :attractions="getDayAttractions(day.day || index + 1)"
@@ -167,19 +169,26 @@ const carouselStyle = computed(() => {
 })
 
 // ✅ 获取某天的景点
+// 用 Number 比较：老数据里 day 可能是 "1" 这样的字符串，严格相等会整天筛空
 const getDayAttractions = (dayNum) => {
   if (!props.plan.map_data || !props.plan.map_data.attractions) return []
-  return props.plan.map_data.attractions.filter(a => a.day === dayNum)
+  return props.plan.map_data.attractions.filter(a => Number(a.day) === Number(dayNum))
 }
 
-// ✅ 获取某天的路线（起点在当天的景点）
+// ✅ 获取某天的路线
+// 优先读后端写入的 route.day；老数据没有这个字段时才退回"起点是否属于当天景点"。
+// 回退分支只是为了兼容历史消息，不要把它当成主逻辑——按景点名反推在
+// 重名景点（两条街都叫"中山路"）或跨天复用同一个点时会把路线挂错天。
 const getDayRoutes = (dayNum) => {
   if (!props.plan.map_data || !props.plan.map_data.routes) return []
-  const dayAttractions = getDayAttractions(dayNum)
-  const dayNames = dayAttractions.map(a => a.name)
+  const routes = props.plan.map_data.routes
+  const dayNames = new Set(getDayAttractions(dayNum).map(a => a.name))
 
-  return props.plan.map_data.routes.filter(route => {
-    return dayNames.includes(route.from)
+  return routes.filter(route => {
+    if (route.day !== undefined && route.day !== null && route.day !== '') {
+      return Number(route.day) === Number(dayNum)
+    }
+    return dayNames.has(route.from)
   })
 }
 

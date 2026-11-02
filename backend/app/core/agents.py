@@ -626,6 +626,15 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
 
     可用景点：
     {state.get('attractions_pool') or '无'}
+
+    规划要求：
+    - 每天至少安排 2 个**具体景点/地点**，写全名（例如"星海广场""老虎滩海洋公园"），
+      优先从"可用景点"里选。不要写"游览大连广场与公园""自由活动""逛街"这种
+      没法在地图上定位的笼统描述——地图是按天标注这些地名的。
+    - 每天安排 3~6 个活动条目（含餐饮、返程），**不要超过 6 个**：
+      超过会被质检判为当天安排过密而打回重排，白白多等一次。
+    - 最后一天如果主要是返程，也要落到具体地点（例如"大连站""周水子国际机场"），
+      可以写"返程：大连站 → 周水子国际机场"，但别把一整天都写成"自由活动"。
 {review_block}
     请生成详细的每日行程，包含景点、餐饮、住宿建议。
     只输出一个 JSON 对象，不要加 ```json 代码围栏，不要输出任何解释文字。
@@ -996,9 +1005,14 @@ async def extract_attractions_with_llm(state: TripState, plan_data: dict) -> Lis
 
     ## 提取规则
     1. **只提取景点**：如公园、广场、博物馆、海滩、山、寺、塔、古城、步行街等
-    2. **识别**：未给出明确地点则从最经地方随机选择一处街道
-    3. **去重**：同一个景点只提取一次
-    4. **别名**：如果景点有别名，使用标准名称
+    2. **只认原文**：景点名必须是行程里原样出现过的地名。禁止推断、补充，
+       绝对不要因为"这天没写具体地点"就自己挑一条街凑数——
+       地图上多出一个没去过的地方，比少一个更糟。
+    3. **没有就跳过**：某一天全是餐饮、住宿、自由活动、返程这类没有具体地名的安排，
+       就不要给那天输出任何景点（那天照常显示"没有需要标注的景点"）。
+    4. **去重**：同一个景点只提取一次，不要跨天重复计数
+    5. **别名**：如果景点有别名，使用标准名称
+    6. **上限**：每天最多 6 个，挑最能代表当天的
 
     ## 返回格式
     返回 JSON 数组，包含景点名称和它出现的天数：
@@ -1305,18 +1319,31 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
               f"（精确定位 {len(located) - len(failed)} 个，估算 {len(failed)} 个）")
 
         # 3. 规划路线（如果有多个景点）
+        # 先按天分组再组内串联：原来是在全局序列上取相邻对、靠 day 是否相等来过滤，
+        # 一旦提取顺序不是严格按天（例如 Day2 只提到一个景点），相邻对就会落在跨天上
+        # 被整段丢弃，那天本该有的路线也跟着没了。按天分组后组内相邻，逻辑与"天内动线"一致。
         routes = []
-        if len(attractions_with_coords) >= 2:
-            for i in range(len(attractions_with_coords) - 1):
-                origin = attractions_with_coords[i]
-                dest = attractions_with_coords[i + 1]
+        day_order: List[int] = []
+        grouped: Dict[int, List[Dict]] = {}
+        for attr in attractions_with_coords:
+            try:
+                day_no = int(attr.get("day") or 1)
+            except (TypeError, ValueError):
+                day_no = 1
+            attr["day"] = day_no
+            if day_no not in grouped:
+                grouped[day_no] = []
+                day_order.append(day_no)
+            grouped[day_no].append(attr)
 
-                # ✅ 关键：只在同一天内生成路线，跳过跨天
-                origin_day = origin.get("day", 1)
-                dest_day = dest.get("day", 1)
-                if origin_day != dest_day:
-                    print(f"⏭️ 跳过跨天路线: {origin['name']}(Day{origin_day}) → {dest['name']}(Day{dest_day})")
-                    continue
+        for day_no in day_order:
+            day_attrs = grouped[day_no]
+            if len(day_attrs) < 2:
+                continue
+            for i in range(len(day_attrs) - 1):
+                origin = day_attrs[i]
+                dest = day_attrs[i + 1]
+                origin_day = day_no
 
                 try:
                     print(f"🚗 规划路线: {origin['name']} → {dest['name']}")
@@ -1324,6 +1351,9 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
                     routes.append({
                         "from": origin["name"],
                         "to": dest["name"],
+                        # day：前端按天取路线时直接读这个字段，不再靠"起点名字属于哪天"反推。
+                        # 名字反推的隐患是重名景点（如两座城市都有"中山路"）或跨天复用同一个点。
+                        "day": origin_day,
                         "from_coord": [origin["lng"], origin["lat"]],
                         "to_coord": [dest["lng"], dest["lat"]],
                         "distance": route_info.get("distance", 0),
@@ -1338,6 +1368,7 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
                     routes.append({
                         "from": origin["name"],
                         "to": dest["name"],
+                        "day": origin_day,
                         "from_coord": [origin["lng"], origin["lat"]],
                         "to_coord": [dest["lng"], dest["lat"]],
                         "distance": 0,
@@ -1351,10 +1382,12 @@ async def generate_map_data(state: TripState, plan_data: dict) -> Dict:
             for point in [route["from"], route["to"]]:
                 if point not in existing_names:
                     # 用路线的端点坐标补一个 attraction
+                    # day 取路线自己的天数；原来硬编码成 1，相当于把所有补出来的点
+                    # 都算到第一天头上
                     coord = route["from_coord"] if point == route["from"] else route["to_coord"]
                     attractions_with_coords.append({
                         "name": point,
-                        "day": 1,
+                        "day": route.get("day", 1),
                         "lng": coord[0],
                         "lat": coord[1]
                     })

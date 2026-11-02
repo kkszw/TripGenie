@@ -10,7 +10,12 @@
       >{{ approxCount }} 个估算位置</span>
       <span class="day-map-count">{{ attractions.length }} 个景点</span>
     </div>
+    <div v-if="isEmpty" class="day-map-empty">
+      <span class="day-map-empty-icon">🧭</span>
+      <span class="day-map-empty-text">这一天没有需要标注的景点，可能是自由活动或返程。</span>
+    </div>
     <div
+        v-else
         :id="mapId"
         class="day-map-container"
     >
@@ -60,6 +65,10 @@ const colors = ['#4f6ef7', '#ef4444', '#22c55e', '#f59e0b', '#8b5cf6']
 const getColor = (idx) => colors[idx % colors.length]
 
 const approxCount = computed(() => (props.attractions || []).filter(a => a && a.approx).length)
+
+// 某天一个景点都没提取到（自由活动/返程），就别画一张空白地图，
+// 给一句说明——否则用户只会以为地图坏了。
+const isEmpty = computed(() => !(props.attractions || []).length)
 
 // 同一坐标的多个景点会互相遮挡，看起来像"少了一个点"
 // （后端以前把查不到坐标的景点全画在城市中心点上，就出现过这种情况）。
@@ -378,6 +387,27 @@ onUnmounted(() => {
   border-radius: 8px;
   overflow: hidden;
   background: #e8edf5;
+}
+
+.day-map-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 120px;
+  padding: 16px;
+  border-radius: 8px;
+  border: 1px dashed #cdd6e4;
+  background: #f7f9fc;
+  color: #6b7280;
+  font-size: 12px;
+  text-align: center;
+}
+
+.day-map-empty-icon {
+  font-size: 20px;
+  line-height: 1;
 }
 
 .day-map-error {
