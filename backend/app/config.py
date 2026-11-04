@@ -43,6 +43,11 @@ class Settings(BaseSettings):
 
     # 高德地图
     amap_api_key: str = os.getenv("AMAP_API_KEY")
+    # 折线抽稀容差（米）：删掉的点到保留折线的偏离不超过它，形状不变。
+    # 设 0 关闭几何抽稀；调大会更省体积，但急弯处会被削平。
+    map_polyline_tolerance_m: float = float(os.getenv("MAP_POLYLINE_TOLERANCE_M", "6"))
+    # 单段路线折线点数上限（兜底，正常情况下 DP 抽稀后远低于它）
+    map_polyline_max_points: int = int(os.getenv("MAP_POLYLINE_MAX_POINTS", "400"))
 
     # OpenWeather
     weather_api_key: str = os.getenv("WEATHER_API_KEY")

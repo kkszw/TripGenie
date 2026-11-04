@@ -14,6 +14,7 @@ from app.rag.retriever import *
 from langgraph.graph import END
 from langgraph.types import interrupt
 from app.mcp.client import getAllTools
+from app.services.polyline import simplify_polyline
 
 #
 # DeepSeek 走 OpenAI 兼容端点，所以统一用 ChatOpenAI 指向它，换供应商只改 .env。
@@ -1623,6 +1624,20 @@ def parse_route_result(result: Any) -> Dict:
 
     if not polyline:
         print(f"  ⚠️ 拿到距离 {distance}m 但没有折线，可用字段: {list(path)[:8]}")
+
+    # 抽稀：这段折线接着会进 SSE、进 SQLite 历史，还要供下次回放。
+    # 原始 200~400 点在屏幕上看不出区别，按 6 米容差压到几十点，
+    # 形状不变（DP 保证被删点偏离不超过容差），消息体积能降一个量级。
+    raw_count = len(polyline)
+    if raw_count > 2:
+        polyline = simplify_polyline(
+            polyline,
+            tolerance_m=settings.map_polyline_tolerance_m,
+            max_points=settings.map_polyline_max_points,
+        )
+        if raw_count >= 100:
+            print(f"  ✂️ 折线抽稀 {raw_count} → {len(polyline)} 点")
+
     return {"distance": distance, "duration": duration, "polyline": polyline}
 
 
