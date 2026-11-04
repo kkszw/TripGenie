@@ -21,6 +21,7 @@ from app.services.polyline import simplify_polyline
 logger = get_logger(__name__)
 
 AMAP_PLACE_TEXT_URL = "https://restapi.amap.com/v3/place/text"
+AMAP_GEOCODE_URL = "https://restapi.amap.com/v3/geocode/geo"
 AMAP_DRIVING_URL = "https://restapi.amap.com/v3/direction/driving"
 
 # POI 名字里带这些词的通常是停车场、出入口之类的配套设施，不是景点本体
@@ -31,6 +32,54 @@ _POI_NOISE = ("停车场", "停车楼", "售票处", "出入口", "公厕", "卫
 # 而 MCP 兜底只在 REST 失败时才走——那时候本来就已经慢了，串行换确定性更划算。
 # REST 路径不受这把锁影响，并发照常。
 _MCP_LOCK = asyncio.Lock()
+
+# 高德这些 infocode 表示"这次没配额/太频繁"，不是查询本身有问题：
+#   10021 CUQPS_HAS_EXCEEDED_THE_LIMIT（并发过高）
+#   10019/10020/10029 各类日调用量或配额超限
+# 遇到它们应该等一会儿再试，而不是判定"这个地方查不到"。
+_AMAP_RETRY_CODES = {"10021", "10019", "10020", "10029"}
+_AMAP_MAX_ATTEMPT = 3
+
+
+async def amap_get(url: str, params: Dict, what: str,
+                   timeout: float = 8.0) -> Optional[Dict]:
+    """高德 REST GET，统一处理网络抖动和 QPS 限流。
+
+    为什么三个接口都要走这里：个人 Key 的 QPS 限制很低，地图阶段并发一上来
+    就回 10021。以前这个处理只写在驾车路线里，地理编码和 POI 遇到限流直接
+    放弃 —— 于是一个本来能查到的景点被判成"未定位"，掉进估算排布，地图上
+    位置就偏了。**限流应该表现为"慢一点"，而不是"结果错"**。
+
+    返回解析好的 JSON；彻底失败返回 {}。
+    """
+    last: Dict = {}
+    for attempt in range(_AMAP_MAX_ATTEMPT):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.get(url, params=params)
+                data = resp.json()
+        except Exception as e:
+            logger.warning(f"{what} 请求失败",
+                           extra={"err": str(e), "attempt": attempt + 1})
+            data = {}
+
+        if str(data.get("status")) == "1":
+            return data
+
+        code = str(data.get("infocode"))
+        if code in _AMAP_RETRY_CODES and attempt < _AMAP_MAX_ATTEMPT - 1:
+            delay = 0.4 * (attempt + 1)
+            logger.debug(f"{what} 触发限流，退避重试",
+                         extra={"infocode": code, "delay": delay})
+            await asyncio.sleep(delay)
+            continue
+        last = data
+        break
+
+    if last:
+        logger.warning(f"{what} 返回异常",
+                       extra={"info": last.get("info"), "infocode": last.get("infocode")})
+    return {}
 
 
 def _pick_best_poi(name: str, pois: List[Dict]) -> Optional[Dict]:
@@ -88,17 +137,12 @@ async def poi_search_rest(name: str, region: "Region") -> Optional[Dict]:
             params["citylimit"] = "true"
 
     try:
-        async with httpx.AsyncClient(timeout=8) as client:
-            resp = await client.get(AMAP_PLACE_TEXT_URL, params=params)
-            data = resp.json()
-    except Exception as e:
-        logger.warning("POI 搜索请求失败", extra={"poi": name, "err": str(e)})
+        data = await amap_get(AMAP_PLACE_TEXT_URL, params, "POI 搜索")
+    except Exception as e:            # amap_get 已兜住异常，这里是最后一道
+        logger.warning("POI 搜索失败", extra={"poi": name, "err": str(e)})
         return None
 
-    if str(data.get("status")) != "1":
-        logger.warning("POI 搜索返回异常",
-                       extra={"poi": name, "info": data.get("info"),
-                              "infocode": data.get("infocode")})
+    if not data:
         return None
 
     pois = data.get("pois") or []
@@ -113,6 +157,68 @@ async def poi_search_rest(name: str, region: "Region") -> Optional[Dict]:
                  extra={"query": name, "hit": best.get("name"),
                         "district": best.get("adname"), "coord": f"{lng_str},{lat_str}"})
     return {"lng": float(lng_str), "lat": float(lat_str)}
+
+
+async def geocode_rest(address: str, region: "Region",
+                       allow_admin: bool = False) -> Optional[Dict]:
+    """高德 REST 地理编码（地址 → 坐标）。
+
+    为什么地理编码也要走 REST：MCP 工具挂在 stdio 子进程上，单次 1s 上下，
+    而且**没有内建超时**——并发场景下一次响应丢失就会把整条请求挂死
+    （实测评测里卡过 300 秒，最后被外层超时杀掉）。REST 一次 50~150ms、
+    能设 timeout、能并发，返回结构和 MCP 那版一样，解析逻辑可以共用。
+
+    地域约束同样走 region.query_value：只给省份时传省级 adcode。
+    allow_admin=True 时接受"只定位到行政区"的结果，仅在查目的地中心点时使用。
+    """
+    key = getattr(settings, "amap_api_key", None)
+    if not key or not address:
+        return None
+
+    params = {"key": key, "address": address}
+    city_value = region.query_value if region else None
+    if city_value:
+        params["city"] = city_value
+
+    try:
+        data = await amap_get(AMAP_GEOCODE_URL, params, "地理编码")
+    except Exception as e:            # amap_get 已兜住异常，这里是最后一道
+        logger.warning("地理编码 REST 失败", extra={"query": address, "err": str(e)})
+        return None
+
+    if not data:
+        return None
+
+    # extract_location_from_dict 已经带"只定位到行政区就丢弃"的校验，
+    # 所以查不到的景点不会被当成城市中心点混进来
+    return extract_location_from_dict(data, allow_admin=allow_admin) or None
+
+
+async def geocode_mcp(geo_tool, address: str, city_value: Optional[str],
+                      timeout: float = 10.0) -> Optional[Dict]:
+    """MCP 地理编码兜底：串行 + 超时。
+
+    两个约束都是必需的：
+      - 锁：MCP 工具共用一条 stdio 会话，适配器对并发请求的行为没有文档保证；
+      - 超时：MCP 调用本身没有超时，响应一旦丢失就永久挂起。没有这层，
+        一次卡住就能把整条请求拖到外层超时才结束，用户看到的是"转圈五分钟"。
+    """
+    if not geo_tool:
+        return None
+    try:
+        async with _MCP_LOCK:
+            result = await asyncio.wait_for(
+                geo_tool.ainvoke({"address": address, "city": city_value}), timeout
+            )
+    except asyncio.TimeoutError:
+        logger.warning("MCP 地理编码超时，改用其他方式",
+                       extra={"query": address, "timeout": timeout})
+        return None
+    except Exception as e:
+        logger.warning("MCP 地理编码异常",
+                       extra={"query": address, "err": str(e)})
+        return None
+    return parse_coordinates(result)
 
 
 def unwrap_mcp_result(result: Any) -> Optional[Dict]:
@@ -283,28 +389,10 @@ async def driving_route_rest(origin: Dict, dest: Dict) -> Optional[Dict]:
     except (KeyError, TypeError, ValueError):
         return None
 
-    # 高德对并发有 QPS 限制（个人 Key 很低），连续请求会回 10021，
-    # 所以这里遇到 QPS 超限退避重试几次，别直接把这条路线丢掉。
-    data: Dict = {}
-    for attempt in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=8) as client:
-                resp = await client.get(AMAP_DRIVING_URL, params=params)
-                data = resp.json()
-        except Exception as e:
-            logger.warning("驾车路线 REST 请求失败", extra={"err": str(e)})
-            data = {}
-        if str(data.get("status")) == "1":
-            break
-        if str(data.get("infocode")) == "10021" and attempt < 2:
-            logger.debug("高德 QPS 超限，退避重试", extra={"attempt": attempt + 1})
-            await asyncio.sleep(0.5 * (attempt + 1))
-            continue
-        logger.warning("驾车路线 REST 返回异常",
-                       extra={"info": data.get("info"), "infocode": data.get("infocode")})
-        return None
-
-    if str(data.get("status")) != "1":
+    # 高德对并发有 QPS 限制（个人 Key 很低），连续请求会回 10021。
+    # 重试和退避统一在 amap_get 里，这里只关心"拿到了/没拿到"。
+    data = await amap_get(AMAP_DRIVING_URL, params, "驾车路线")
+    if not data:
         return None
 
     # extensions=base 时 steps 里也带 polyline；parse_route_result 会按顺序拼起来

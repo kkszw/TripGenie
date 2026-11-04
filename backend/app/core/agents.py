@@ -21,6 +21,8 @@ from app.core.prompts import *  # noqa: F401,F403
 from app.core.prompts import __all__ as _prompts_all
 from app.services.amap import (
     driving_route_rest,
+    geocode_mcp,
+    geocode_rest,
     parse_coordinates,
     parse_polyline,
     parse_route_result,
@@ -38,8 +40,9 @@ from app.services.map_data import (
 )
 
 _AMAP_ALL = [
-    "driving_route_rest", "parse_coordinates", "parse_polyline",
-    "parse_route_result", "plan_driving_route", "poi_search_rest",
+    "driving_route_rest", "geocode_rest", "geocode_mcp",
+    "parse_coordinates", "parse_polyline", "parse_route_result",
+    "plan_driving_route", "poi_search_rest",
     "extract_attractions_with_llm", "generate_map_data",
     "geocode_attraction", "locate_attraction", "plan_segment",
     "resolve_center_base", "scatter_around",

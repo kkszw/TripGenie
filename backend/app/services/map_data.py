@@ -15,7 +15,7 @@ from app.config import settings
 from app.core import llm as llm_runtime
 from app.core.logging import get_logger
 from app.core.prompts import build_attraction_prompt
-from app.services.amap import parse_coordinates, plan_driving_route, poi_search_rest
+from app.services.amap import geocode_mcp, geocode_rest, plan_driving_route, poi_search_rest
 from app.services.geo import Region, is_offset_ok, parse_region
 
 logger = get_logger(__name__)
@@ -98,11 +98,17 @@ async def geocode_attraction(geo_tool, name: str, region: Region) -> Optional[Di
     """查单个景点的精确坐标，查不到返回 None（不编造坐标）
 
     高德对不规范的名字会静默返回"城市中心点"而不是报错，所以这里用
-    parse_coordinates 的行政区级校验把那种结果挡掉，再逐级降级：
-      1. 地理编码：城市名 + 景点名（景点名已含城市名时不重复拼）
+    行政区级校验把那种结果挡掉，再逐级降级：
+      1. REST 地理编码：城市名 + 景点名（景点名已含城市名时不重复拼）
       2. REST POI 关键词搜索（能命中非规范名称，比如"椰梦长廊-椰林海滩"）
-      3. 裸景点名再走一次地理编码（"椰梦长廊"这种本地名带城市反而查不到）
-    三级都失败才交给上层做估算排布。
+      3. REST 地理编码（裸名）
+      4. MCP 地理编码兜底（串行 + 超时）
+    四级都失败才交给上层做估算排布。
+
+    顺序为什么把 REST 放前面：MCP 每次都走 stdio 子进程、单次 1s 上下，而且
+    **没有超时**——并发场景下一次响应丢失就会把整条请求挂死。REST 一次
+    50~150ms，有 timeout，能安全并发。MCP 留作最后兜底，因为它对"非规范
+    地名"有时能给出 REST 拿不到的结果。
 
     地域约束一律走 region.query_value，**不要**自己拼城市字符串：
     目的地只给了省份时它给的是省级 adcode，否则"芙蓉街""大明湖"这种
@@ -113,42 +119,37 @@ async def geocode_attraction(geo_tool, name: str, region: Region) -> Optional[Di
         base = f"{region.city}{name}"
     city_value = region.query_value
 
-    # 1) 组合名地理编码
-    if geo_tool:
-        try:
-            logger.debug("地理编码", extra={"poi": name, "query": base,
-                                         "region": region.label or "全国"})
-            result = await geo_tool.ainvoke({"address": base, "city": city_value})
-            coords = parse_coordinates(result)
-            if coords:
-                logger.debug("坐标命中", extra={"poi": name, **coords})
-                return coords
-            logger.debug("未定位到具体地点", extra={"query": base})
-        except Exception as e:
-            logger.warning("地理编码异常", extra={"query": base, "err": str(e)})
+    # 1) REST 地理编码（组合名）
+    coords = await geocode_rest(base, region)
+    if coords:
+        logger.debug("坐标命中（REST 地理编码）", extra={"poi": name, "query": base, **coords})
+        return coords
+    logger.debug("REST 地理编码未定位", extra={"query": base,
+                                          "region": region.label or "全国"})
 
-    # 2) POI 关键词搜索兜底
+    # 2) REST POI 关键词搜索兜底
     coords = await poi_search_rest(name, region)
     if coords:
         return coords
 
-    # 3) 裸名地理编码
-    if geo_tool and base != name:
-        try:
-            logger.debug("地理编码（裸名）", extra={"poi": name,
-                                                 "region": region.label or "全国"})
-            result = await geo_tool.ainvoke({"address": name, "city": city_value})
-            coords = parse_coordinates(result)
-            if coords:
-                logger.debug("坐标命中", extra={"poi": name, **coords})
-                return coords
-            logger.debug("未定位到具体地点", extra={"query": name})
-        except Exception as e:
-            logger.warning("地理编码异常", extra={"query": name, "err": str(e)})
+    # 3) REST 地理编码（裸名）：有些本地名带上城市反而查不到
+    if base != name:
+        coords = await geocode_rest(name, region)
+        if coords:
+            logger.debug("坐标命中（裸名）", extra={"poi": name, **coords})
+            return coords
 
-    # 三级都失败用 warning 而不是 debug：这意味着地图上这个点是估算位置，
+    # 4) MCP 兜底（串行 + 超时）
+    coords = await geocode_mcp(geo_tool, base, city_value)
+    if not coords and base != name:
+        coords = await geocode_mcp(geo_tool, name, city_value)
+    if coords:
+        logger.debug("坐标命中（MCP 兜底）", extra={"poi": name, **coords})
+        return coords
+
+    # 全部失败用 warning 而不是 debug：这意味着地图上这个点是估算位置，
     # 用户看到的是"大概在这一带"，属于需要知道的降级，不该被日志级别过滤掉。
-    logger.warning("景点三级查询均失败，改用估算坐标", extra={"poi": name})
+    logger.warning("景点四级查询均失败，改用估算坐标", extra={"poi": name})
     return None
 
 
@@ -173,22 +174,23 @@ async def get_region_center(geo_tool, region: Region) -> Optional[Tuple[float, f
       2. 给定位失败的景点当估算基准。
     拿不到就返回 None，调用方跳过校验——校验是兜底手段，它自己失败不该连累正常景点。
     """
-    if not geo_tool or not region.center_query:
+    if not region.center_query:
         return None
-    try:
-        # allow_admin=True：这里要的就是行政区中心点，不是景点
-        result = await geo_tool.ainvoke({
-            "address": region.center_query,
-            "city": region.query_value,
-        })
-        coords = parse_coordinates(result, allow_admin=True)
-        if coords:
-            logger.debug("目的地中心", extra={"region": region.label, **coords})
-            return coords["lng"], coords["lat"]
-        logger.warning("未取到目的地中心，本轮跳过坐标合理性校验",
-                       extra={"region": region.label})
-    except Exception as e:
-        logger.warning("获取目的地中心失败", extra={"err": str(e)})
+
+    # REST 优先：这条路径上有超时，不会因为 MCP 子进程卡住把整条请求带走
+    coords = await geocode_rest(region.center_query, region, allow_admin=True)
+    if coords:
+        logger.debug("目的地中心（REST）", extra={"region": region.label, **coords})
+        return coords["lng"], coords["lat"]
+
+    # MCP 兜底（串行 + 超时）
+    coords = await geocode_mcp(geo_tool, region.center_query, region.query_value)
+    if coords:
+        logger.debug("目的地中心（MCP）", extra={"region": region.label, **coords})
+        return coords["lng"], coords["lat"]
+
+    logger.warning("未取到目的地中心，本轮跳过坐标合理性校验",
+                   extra={"region": region.label})
     return None
 
 
@@ -333,7 +335,7 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
         failed: List[Dict] = []
 
         if not geo_tool:
-            logger.warning("geo_tool 不存在，所有景点都将使用估算坐标")
+            logger.debug("MCP 工具未就绪，地理编码只走 REST，没有兜底路径")
 
         # 并发定位：以前是一个接一个 await，10 个景点光地理编码就要十几秒，
         # 而它们之间没有任何依赖。并发度由 MAP_CONCURRENCY 控制——
