@@ -208,6 +208,8 @@ cp .env.example .env          # Windows: copy .env.example .env
 | `EMBEDDING_BATCH_SIZE` | 单批文本条数，官方上限 20 |
 | `LLM_TIMEOUT` | 单次 LLM 调用超时秒数，默认 120 |
 | `AMAP_API_KEY` | 高德 **Web 服务** Key，会透传给 MCP Server |
+| `MAP_POLYLINE_TOLERANCE_M` | 折线抽稀容差（米），默认 6。被删掉的点到保留折线的偏离不超过该值，所以路径形状不变；设 0 关闭几何抽稀。**不能留空**，留空启动会报 `ValueError` |
+| `MAP_POLYLINE_MAX_POINTS` | 单段折线点数上限，默认 400。仅作兜底，正常抽稀后远低于该值；设 0 表示不限制 |
 | `WEATHER_API_KEY` | 天气接口（可不填，天气节点失败不影响主流程） |
 | `UVX_PATH` | uvx 可执行文件路径。**留空则自动探测** PATH 与当前虚拟环境 |
 | `JWT_SECRET` | 登录令牌签名密钥。**必须固定一个随机串**，否则每次重启都会把所有人踢下线 |
