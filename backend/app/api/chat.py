@@ -349,7 +349,10 @@ async def _run_stream(thread_id: str,
                                     "destination": output.get("destination", ""),
                                     "totalDays": len(draft_plan),
                                     "budget": output.get("budget", 0),
-                                    "tips": output.get("plan_tips", [])
+                                    "tips": output.get("plan_tips", []),
+                                    # 排程重排后当天塞不下的活动：前端可以据此提示
+                                    # "这个点没排进去"，而不是让用户到当地才发现。
+                                    "dropped": output.get("schedule_dropped") or []
                                 }
                                 # 摘要里带上目的地和天数：事后翻 runs.jsonl，
                                 # 一眼能看出这行是"青岛三天"还是"山东全省七天"

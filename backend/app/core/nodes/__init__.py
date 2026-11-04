@@ -7,6 +7,7 @@
   confirm   — 人工确认（HITL）与放弃
   retrieval — 攻略/景点/天气三个并行取数节点
   plan      — 行程生成
+  schedule  — 排程优化（重排顺序 + 重算时间轴）
   review    — 行程质检（规则 + 模型）
   map       — 地图数据
   chat      — 闲聊与工具调用
@@ -32,6 +33,7 @@ from app.core.nodes.review import (
     route_after_review,
 )
 from app.core.nodes.routing import classify_input, intent_router
+from app.core.nodes.schedule import optimize_schedule_node
 from app.core.nodes.slots import clarify, format_input, route_after_format
 
 __all__ = [
@@ -42,6 +44,7 @@ __all__ = [
     "confirm_needs", "cancelled", "route_after_confirm",
     "retrieve_guides", "search_attractions_node", "get_weather_node",
     "generate_plan_node", "format_response",
+    "optimize_schedule_node",
     "review_plan_node", "route_after_review",
     "generate_map_node",
     # 质检的可单独测试的部件

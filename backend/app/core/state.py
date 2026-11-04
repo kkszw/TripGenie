@@ -93,6 +93,13 @@ class TripState(TypedDict):
     review_round: NotRequired[int]
     # plan_tips：行程 JSON 里的 tips，落库/推送 trip_plan 时要带上
     plan_tips: NotRequired[List[str]]
+
+    # ===== 排程优化：把"几点到几点"从 LLM 手里拿回来 =====
+    # schedule_dropped：按真实通勤时间重排后当天塞不下的活动。有值必须告诉用户
+    #   "这个点没排进去"，而不是让他到了当地才发现。
+    schedule_dropped: NotRequired[List[Dict]]
+    # schedule_stats：重排后的短间隔占比与估算通勤时长，写进运行摘要用于前后对比。
+    schedule_stats: NotRequired[Dict]
     # review_error：质检自己挂了（LLM 超时/解析失败）。只告警，不阻断行程
     review_error: Optional[str]
     # review_conflicts：用户约束自相矛盾之处（要求一天跨两城等）。

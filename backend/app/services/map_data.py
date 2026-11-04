@@ -300,6 +300,66 @@ async def plan_segment(day_no: int, origin: Dict, dest: Dict,
         }
 
 
+# 排程阶段只需要"两个点是不是同一片"，同一份行程里景点名会重复出现
+# （跨天、重排、重试），缓存一下避免重复打高德。
+_COORD_CACHE: Dict[Tuple[str, str], Tuple[float, float]] = {}
+_COORD_CACHE_MAX = 512
+
+
+async def resolve_coords(names: List[str], region: Region,
+                         concurrency: Optional[int] = None) -> Dict[str, Tuple[float, float]]:
+    """批量把地名解析成坐标，返回 {地名: (lng, lat)}。
+
+    只走 REST：150ms 级、可并发、有超时。排程是生成行程之后的前置步骤，
+    不能因为某个 MCP 调用没有超时把整条规划拖死（那次挂 300 秒的教训）。
+
+    查不到的地名直接跳过，对应活动在排程里保持原位——排程是增强，不是必经关卡。
+    """
+    unique: List[str] = []
+    for name in names:
+        if name and name not in unique:
+            unique.append(name)
+    if not unique:
+        return {}
+
+    city_key = region.query_value or ""
+    found = {name: _COORD_CACHE[(name, city_key)]
+             for name in unique if (name, city_key) in _COORD_CACHE}
+    pending = [name for name in unique if name not in found]
+    if not pending:
+        return found
+
+    sem = asyncio.Semaphore(max(1, concurrency or settings.map_concurrency))
+
+    async def locate(name: str):
+        async with sem:
+            try:
+                # 先按"城市+景点名"查地址，再用 POI 搜索兜底。景点名大多不是规范
+                # 地址，纯 geocode 会大量返回 30001（数据异常），走 POI 才有命中。
+                base = name
+                if region.city and not base.startswith(region.city):
+                    base = f"{region.city}{name}"
+                data = await geocode_rest(base, region)
+                if not data:
+                    data = await poi_search_rest(name, region)
+            except Exception as e:
+                logger.debug("排程地理编码失败", extra={"poi": name, "err": str(e)})
+                return name, None
+        if not data:
+            return name, None
+        return name, (float(data["lng"]), float(data["lat"]))
+
+    for name, coord in await asyncio.gather(*(locate(n) for n in pending)):
+        if coord is None:
+            continue
+        if len(_COORD_CACHE) >= _COORD_CACHE_MAX:
+            _COORD_CACHE.clear()
+        _COORD_CACHE[(name, city_key)] = coord
+        found[name] = coord
+
+    return found
+
+
 async def generate_map_data(state, plan_data: dict) -> Dict:
     """生成地图数据：景点坐标和路线"""
     try:

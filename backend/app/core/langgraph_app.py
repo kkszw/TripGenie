@@ -12,6 +12,7 @@ from app.core.nodes import (
     generate_plan_node,
     get_weather_node,
     intent_router,
+    optimize_schedule_node,
     retrieve_guides,
     review_plan_node,
     route_after_confirm,
@@ -50,6 +51,10 @@ async def create_workflow():
     workflow.add_node("retrieve_guides", retrieve_guides)
     workflow.add_node("search_attractions", search_attractions_node)
     workflow.add_node("generate_plan", generate_plan_node)
+    # 排程优化：LLM 定"去哪几个"，这里定"几点到几点"。放在质检前面，
+    # 让 review_plan 校验的是修好的版本，不再为"10:30 结束紧接着 10:30 开始"
+    # 这种问题白打回一次重排。
+    workflow.add_node("optimize_schedule", optimize_schedule_node)
     # 地图单独成节点：质检可能把 generate_plan 打回重排，地图只该出一次
     workflow.add_node("review_plan", review_plan_node)
     workflow.add_node("generate_map", generate_map_node)
@@ -76,9 +81,10 @@ async def create_workflow():
     workflow.add_edge("search_attractions", "generate_plan")
     workflow.add_edge("get_weather", "generate_plan")
 
-    # 生成 → 质检 →（不过则带着 feedback 回 generate_plan，最多一轮）→ 出地图
+    # 生成 → 排程 → 质检 →（不过则带着 feedback 回 generate_plan，最多一轮）→ 出地图
     # 自环用的是条件边：route_after_review 返回 ["generate_plan"] 就是回到上游重跑。
-    workflow.add_edge("generate_plan", "review_plan")
+    workflow.add_edge("generate_plan", "optimize_schedule")
+    workflow.add_edge("optimize_schedule", "review_plan")
     workflow.add_conditional_edges("review_plan", route_after_review)
     workflow.add_edge("generate_map", END)
 
