@@ -8,7 +8,21 @@
 
 ## 界面预览
 
-<!-- TODO: 补充截图 -->
+一句话说清想怎么玩，剩下的交给它：
+
+<img src="docs/screenshots/01-home.png" width="860" alt="主界面">
+
+目的地或天数没给准时不会硬猜，先把条件摆出来让人拍板——错了就改，别浪费一次规划：
+
+<img src="docs/screenshots/02-confirm.png" width="860" alt="规划前的人工确认">
+
+确认后并行检索攻略/景点/天气，生成行程并通过质检，再出卡片：
+
+<img src="docs/screenshots/03-plan.png" width="860" alt="行程卡片">
+
+点开看逐日安排，每天附一张当天路线的地图（折线来自高德驾车路径规划，不是两点连直线）：
+
+<img src="docs/screenshots/04-map.png" width="860" alt="逐日行程与路线地图">
 
 ---
 
