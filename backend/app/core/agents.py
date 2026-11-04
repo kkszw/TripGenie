@@ -31,6 +31,8 @@ from app.services.map_data import (
     extract_attractions_with_llm,
     generate_map_data,
     geocode_attraction,
+    locate_attraction,
+    plan_segment,
     resolve_center_base,
     scatter_around,
 )
@@ -39,7 +41,8 @@ _AMAP_ALL = [
     "driving_route_rest", "parse_coordinates", "parse_polyline",
     "parse_route_result", "plan_driving_route", "poi_search_rest",
     "extract_attractions_with_llm", "generate_map_data",
-    "geocode_attraction", "resolve_center_base", "scatter_around",
+    "geocode_attraction", "locate_attraction", "plan_segment",
+    "resolve_center_base", "scatter_around",
 ]
 
 # 常量实例直接绑定即可

@@ -48,6 +48,10 @@ class Settings(BaseSettings):
     map_polyline_tolerance_m: float = float(os.getenv("MAP_POLYLINE_TOLERANCE_M", "6"))
     # 单段路线折线点数上限（兜底，正常情况下 DP 抽稀后远低于它）
     map_polyline_max_points: int = int(os.getenv("MAP_POLYLINE_MAX_POINTS", "400"))
+    # 地图数据生成的并发度（同时打给高德的请求数）。
+    # 个人 Key 的 QPS 很低，调大只会换来一串 10021 和退避重试，反而更慢。
+    # 设 1 等于退回串行，怀疑限流时可以先这样隔离问题。
+    map_concurrency: int = int(os.getenv("MAP_CONCURRENCY", "4"))
 
     # OpenWeather
     weather_api_key: str = os.getenv("WEATHER_API_KEY")

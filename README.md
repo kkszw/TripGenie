@@ -50,11 +50,11 @@
 生成的行程文本本身不含坐标，需要一次**反向结构化**：
 
 1. 用 LLM 从行程中抽取"值得参观的景点/地标"，并标注它出现在第几天
-2. 逐个调用高德 MCP 的地理编码工具拿经纬度（城市名 + 景点名组合搜索以提高命中率）
-3. 调用驾车路径规划工具生成路线，拿到 polyline、距离与耗时
+2. 并发调用高德地理编码拿经纬度（城市名 + 景点名组合搜索以提高命中率，并发度见 `MAP_CONCURRENCY`）
+3. 调用驾车路径规划生成路线，拿到 polyline、距离与耗时
 4. 前端按天渲染独立地图：编号 marker + 彩色路线 + 距离/耗时列表
 
-工程上处理了几个实际问题：**跨天不生成路线**（避免画出"第 1 天景点 → 第 2 天景点"的假路线）；MCP 返回格式在不同工具间不一致，做了多层兼容解析并在 JSON 解析失败时降级为正则提取；地理编码失败时回落到配置的兜底坐标。
+工程上处理了几个实际问题：**跨天不生成路线**（避免画出"第 1 天景点 → 第 2 天景点"的假路线）；MCP 返回格式在不同工具间不一致，做了多层兼容解析并在 JSON 解析失败时降级为正则提取；地理编码失败时回落到估算位置并标记 `approx`，前端用灰色区分。
 
 ### 4. MCP 协议接入外部工具
 
@@ -230,6 +230,7 @@ cp .env.example .env          # Windows: copy .env.example .env
 | `AMAP_API_KEY` | 高德 **Web 服务** Key，会透传给 MCP Server |
 | `MAP_POLYLINE_TOLERANCE_M` | 折线抽稀容差（米），默认 6。被删掉的点到保留折线的偏离不超过该值，所以路径形状不变；设 0 关闭几何抽稀。**不能留空**，留空启动会报 `ValueError` |
 | `MAP_POLYLINE_MAX_POINTS` | 单段折线点数上限，默认 400。仅作兜底，正常抽稀后远低于该值；设 0 表示不限制 |
+| `MAP_CONCURRENCY` | 地图阶段的并发度，默认 4（同时打给高德的请求数）。个人 Key QPS 低，调大反而会撞 10021 限流；设 1 退回串行 |
 | `WEATHER_API_KEY` | 天气接口（可不填，天气节点失败不影响主流程） |
 | `UVX_PATH` | uvx 可执行文件路径。**留空则自动探测** PATH 与当前虚拟环境 |
 | `JWT_SECRET` | 登录令牌签名密钥。**必须固定一个随机串**，否则每次重启都会把所有人踢下线 |
@@ -349,8 +350,8 @@ python evals/run_evals.py --limit 3          # 冒烟
 ```
 18:40:12 INFO  [manual01b] services.map_data 坐标获取完成 total=11 precise=11 approx=0
 18:40:14 INFO  [manual01b] api.chat 行程就绪 days=2 has_map=True
-18:40:14 INFO  [manual01b] core.metrics 运行结束 generate_map=16.2s generate_plan=7.6s
-                                  get_weather=3.0s status=ok total_ms=27738 llm_calls=4 tokens=7330+1505
+18:40:14 INFO  [manual01b] core.metrics 运行结束 generate_plan=8.6s generate_map=5.7s
+                                  get_weather=5.3s status=ok total_ms=20340 llm_calls=4 tokens=7647+1643
 ```
 
 控制台是给人看的彩色行，`logs/app.log` 是 JSON Lines 给机器查（按天轮转，保留 7 天）。
@@ -362,10 +363,10 @@ python evals/run_evals.py --limit 3          # 冒烟
 `logs/runs.jsonl`，一行一个 JSON：
 
 ```json
-{"trace": "manual01b", "status": "ok", "total_ms": 27739.8,
- "nodes": {"generate_map": {"ms": 16234, "pct": 58.5}, "generate_plan": {"ms": 7561, "pct": 27.3}},
- "llm": {"calls": 4, "input_tokens": 7330, "output_tokens": 1505, "by_node": {...}},
- "tools": {"maps_geo": 12, "get_weather": 1},
+{"trace": "manual01b", "status": "ok", "total_ms": 20339.6,
+ "nodes": {"generate_plan": {"ms": 8601, "pct": 42.3}, "generate_map": {"ms": 5742, "pct": 28.2}},
+ "llm": {"calls": 4, "input_tokens": 7647, "output_tokens": 1643, "by_node": {...}},
+ "tools": {"maps_geo": 9, "get_weather": 1},
  "extra": {"destination": "山东省青岛市", "days": 2}}
 ```
 
@@ -373,7 +374,7 @@ python evals/run_evals.py --limit 3          # 冒烟
 
 ### 这套东西测出来的第一件事
 
-一次"青岛两天"的实测分布：
+一次"青岛两天"的实测分布（并发改造**前**）：
 
 | 节点 | 耗时 | 占比 |
 |---|---|---|
@@ -382,9 +383,22 @@ python evals/run_evals.py --limit 3          # 冒烟
 | get_weather | 3.0s | 10.7% |
 | 其余 4 个节点合计 | 2.5s | 9% |
 
-LLM 4 次调用、7330 + 1505 token，外部工具 13 次（12 次地理编码 + 1 次天气）。
+结论很直接：**六成时间在地图节点，而它是一串串行的高德 HTTP 调用**——每个景点查一次坐标、
+每两个相邻景点查一次路线，这些请求彼此没有任何依赖，却排着队等前一个返回。
+之前只能靠临时脚本才测得出来，现在跑一次就有。
 
-结论很直接：**六成时间在地图节点，而它是十几次串行的高德 HTTP 调用**。这个数字以前只能靠临时脚本才测得出来，现在改任何东西跑一次就能对比。
+于是把这两段改成并发（`asyncio.gather` + 信号量限流，`MAP_CONCURRENCY` 默认 4）：
+
+| | 改造前 | 改造后 |
+|---|---|---|
+| generate_map | 16.2s（58.5%） | 5.7s（28.2%） |
+| 整轮规划 | 27.7s | 20.3s |
+
+并发只改"什么时候发请求"，不改判定标准：`gather` 保证结果顺序与提交顺序一致，
+所以景点和路线的排列与串行版完全相同（同一份输入跑五遍，输出逐字段相同）。
+限流是必须的——个人 Key 的 QPS 很低，不设上限只会换来一串 `10021` 和退避重试，反而更慢。
+MCP 兜底路径额外加了一把锁：它底下共用一条 stdio 会话，并发行为没有文档保证，
+而这条本来就在 REST 失败时才走，串行化换确定性更划算。
 
 ### 取舍
 

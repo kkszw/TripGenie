@@ -27,6 +27,11 @@ AMAP_DRIVING_URL = "https://restapi.amap.com/v3/direction/driving"
 _POI_NOISE = ("停车场", "停车楼", "售票处", "出入口", "公厕", "卫生间",
               "地铁站", "公交站", "充电站", "管理中心")
 
+# MCP 工具底下都挂在同一条 stdio 会话上，适配器对并发请求的行为没有文档保证。
+# 而 MCP 兜底只在 REST 失败时才走——那时候本来就已经慢了，串行换确定性更划算。
+# REST 路径不受这把锁影响，并发照常。
+_MCP_LOCK = asyncio.Lock()
+
 
 def _pick_best_poi(name: str, pois: List[Dict]) -> Optional[Dict]:
     """从 POI 搜索结果里挑和目标名字最贴近的一条
@@ -319,10 +324,11 @@ async def plan_driving_route(origin: Dict, dest: Dict) -> Dict:
     driving_tool = llm_runtime.tools_by_name.get("maps_direction_driving_by_coordinates")
     if driving_tool:
         try:
-            result = await driving_tool.ainvoke({
-                "origin": f"{origin['lng']},{origin['lat']}",
-                "destination": f"{dest['lng']},{dest['lat']}"
-            })
+            async with _MCP_LOCK:
+                result = await driving_tool.ainvoke({
+                    "origin": f"{origin['lng']},{origin['lat']}",
+                    "destination": f"{dest['lng']},{dest['lat']}"
+                })
             mcp_info = parse_route_result(result)
             # MCP 只补距离/时长；折线还是以 REST 的为准（MCP 那份是空的）
             if mcp_info.get("distance") or mcp_info.get("duration"):

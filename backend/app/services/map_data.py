@@ -4,6 +4,7 @@
 这里不碰 LangGraph 的 state，入参出参都是普通 dict，
 只有 nodes/map.py 那一层负责读写 state。
 """
+import asyncio
 import json
 import math
 from typing import Dict, List, Optional, Tuple
@@ -93,8 +94,7 @@ async def extract_attractions_with_llm(destination: str, plan_data: dict) -> Lis
         return []
 
 
-async def geocode_attraction(geo_tool, name: str, region: Region,
-                             idx: int = 0, total: int = 0) -> Optional[Dict]:
+async def geocode_attraction(geo_tool, name: str, region: Region) -> Optional[Dict]:
     """查单个景点的精确坐标，查不到返回 None（不编造坐标）
 
     高德对不规范的名字会静默返回"城市中心点"而不是报错，所以这里用
@@ -117,8 +117,7 @@ async def geocode_attraction(geo_tool, name: str, region: Region,
     if geo_tool:
         try:
             logger.debug("地理编码", extra={"poi": name, "query": base,
-                                         "region": region.label or "全国",
-                                         "idx": f"{idx}/{total}"})
+                                         "region": region.label or "全国"})
             result = await geo_tool.ainvoke({"address": base, "city": city_value})
             coords = parse_coordinates(result)
             if coords:
@@ -218,6 +217,87 @@ async def resolve_center_base(located: List[Dict], geo_tool, region: Region,
     return fallback
 
 
+async def locate_attraction(geo_tool, attr: Dict, region: Region,
+                            center_ref: Optional[Tuple[float, float]],
+                            sem: asyncio.Semaphore) -> Optional[Dict]:
+    """定位一个景点、并校验坐标是否落在目的地合理范围内，返回它的最终条目。
+
+    返回 None 表示"没定位到"或"定位到了但判定为错配"，两种都交给上层做估算排布。
+
+    单独抽成函数是为了让调用方能用 gather 并发跑多个。并发只改变"什么时候发请求"，
+    不改判定标准——校验逻辑与串行版逐行一致，否则并发带来的随机顺序会让
+    相同输入产出不同地图，那比慢更糟。
+    """
+    async with sem:
+        # 目的地只到省一级时（"山东"），光有省 adcode 挡不住省内同名地点：
+        # 实测"玉皇顶"会被匹配到临沂那座山、"孔林"会落到菏泽一片。
+        # 景点自带的 city 是行程原文写明的（"乘车前往泰安"），用它把范围收到城市级。
+        # 用户已经指定了城市时一律以用户为准，不信模型的判断。
+        attr_region = region
+        if region.scope != "city" and attr.get("city"):
+            attr_region = Region(
+                city=attr["city"], province=region.province, scope="city"
+            )
+        try:
+            coords = await geocode_attraction(geo_tool, attr["name"], attr_region)
+        except Exception as e:
+            # geocode_attraction 内部已经各自兜了异常，这里是最后一道：
+            # 一个景点炸掉不该让 gather 把整份地图带走。
+            logger.warning("景点定位异常，改用估算坐标",
+                           extra={"poi": attr["name"], "err": str(e)})
+            coords = None
+
+        if not coords:
+            return None
+
+        # 坐标合理性校验：高德对同名地点是"谁相关取谁"，不校验就会把
+        # 济南的芙蓉街变成云南那条、大明湖变成新疆那片。宁可判为未定位
+        # （走估算 + 前端标灰），也不让一个错点把整条路线和地图中心带偏。
+        ok, dist = is_offset_ok((coords["lng"], coords["lat"]), center_ref, region)
+        if not ok:
+            logger.warning("景点坐标超出目的地范围，判为错配改用估算",
+                           extra={"poi": attr["name"], "dist_km": round(dist),
+                                  "limit_km": round(region.max_offset_km),
+                                  "coord": f"{coords['lng']},{coords['lat']}"})
+            return None
+
+        return {**attr, "lng": coords["lng"], "lat": coords["lat"]}
+
+
+async def plan_segment(day_no: int, origin: Dict, dest: Dict,
+                       sem: asyncio.Semaphore) -> Dict:
+    """规划一天里相邻两个景点之间的一段路线。
+
+    无论成功失败都返回一条 route 记录：失败时距离/时长为 0、折线为空，
+    前端会退化成起终点之间的直线——这比这段路线直接消失要好，
+    用户至少知道这两点之间是要走的。
+    """
+    async with sem:
+        try:
+            route_info = await plan_driving_route(origin, dest)
+            logger.debug("路线规划完成",
+                         extra={"from": origin["name"], "to": dest["name"],
+                                "distance_m": route_info.get("distance", 0),
+                                "polyline_pts": len(route_info.get("polyline") or [])})
+        except Exception as e:
+            logger.warning("路线规划失败",
+                           extra={"from": origin["name"], "to": dest["name"],
+                                  "err": str(e)})
+            route_info = {}
+        return {
+            "from": origin["name"],
+            "to": dest["name"],
+            # day：前端按天取路线时直接读这个字段，不再靠"起点名字属于哪天"反推。
+            # 名字反推的隐患是重名景点（如两座城市都有"中山路"）或跨天复用同一个点。
+            "day": day_no,
+            "from_coord": [origin["lng"], origin["lat"]],
+            "to_coord": [dest["lng"], dest["lat"]],
+            "distance": route_info.get("distance", 0),
+            "duration": route_info.get("duration", 0),
+            "polyline": route_info.get("polyline", []),
+        }
+
+
 async def generate_map_data(state, plan_data: dict) -> Dict:
     """生成地图数据：景点坐标和路线"""
     try:
@@ -252,40 +332,22 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
         located: List[Dict] = []
         failed: List[Dict] = []
 
-        for idx, attr in enumerate(attractions):
-            coords = None
-            if geo_tool:
-                # 目的地只到省一级时（"山东"），光有省 adcode 挡不住省内同名地点：
-                # 实测"玉皇顶"会被匹配到临沂那座山、"孔林"会落到菏泽一片。
-                # 景点自带的 city 是行程原文写明的（"乘车前往泰安"），用它把范围收到城市级。
-                # 用户已经指定了城市时一律以用户为准，不信模型的判断。
-                attr_region = region
-                if region.scope != "city" and attr.get("city"):
-                    attr_region = Region(
-                        city=attr["city"], province=region.province, scope="city"
-                    )
-                coords = await geocode_attraction(
-                    geo_tool, attr["name"], attr_region, idx + 1, len(attractions)
-                )
-            else:
-                logger.warning("geo_tool 不存在，所有景点都将使用估算坐标")
+        if not geo_tool:
+            logger.warning("geo_tool 不存在，所有景点都将使用估算坐标")
 
-            # 坐标合理性校验：高德对同名地点是"谁相关取谁"，不校验就会把
-            # 济南的芙蓉街变成云南那条、大明湖变成新疆那片。宁可判为未定位
-            # （走估算 + 前端标灰），也不让一个错点把整条路线和地图中心带偏。
-            if coords:
-                ok, dist = is_offset_ok(
-                    (coords["lng"], coords["lat"]), center_ref, region
-                )
-                if not ok:
-                    logger.warning("景点坐标超出目的地范围，判为错配改用估算",
-                                   extra={"poi": attr["name"], "dist_km": round(dist),
-                                          "limit_km": round(region.max_offset_km),
-                                          "coord": f"{coords['lng']},{coords['lat']}"})
-                    coords = None
-
-            if coords:
-                located.append({**attr, "lng": coords["lng"], "lat": coords["lat"]})
+        # 并发定位：以前是一个接一个 await，10 个景点光地理编码就要十几秒，
+        # 而它们之间没有任何依赖。并发度由 MAP_CONCURRENCY 控制——
+        # 个人高德 Key 的 QPS 很低，无节制并发只会换来一串 10021 和退避重试。
+        # gather 保证结果顺序与输入一致，所以下面的 located/failed 仍按原顺序排，
+        # 地图和路线的呈现不会因为并发而变。
+        sem = asyncio.Semaphore(max(1, settings.map_concurrency))
+        results = await asyncio.gather(*(
+            locate_attraction(geo_tool, attr, region, center_ref, sem)
+            for attr in attractions
+        ))
+        for attr, item in zip(attractions, results):
+            if item:
+                located.append(item)
             else:
                 failed.append(attr)
 
@@ -311,7 +373,6 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
         # 先按天分组再组内串联：原来是在全局序列上取相邻对、靠 day 是否相等来过滤，
         # 一旦提取顺序不是严格按天（例如 Day2 只提到一个景点），相邻对就会落在跨天上
         # 被整段丢弃，那天本该有的路线也跟着没了。按天分组后组内相邻，逻辑与"天内动线"一致。
-        routes = []
         day_order: List[int] = []
         grouped: Dict[int, List[Dict]] = {}
         for attr in attractions_with_coords:
@@ -325,47 +386,21 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
                 day_order.append(day_no)
             grouped[day_no].append(attr)
 
+        pairs: List[Tuple[int, Dict, Dict]] = []
         for day_no in day_order:
             day_attrs = grouped[day_no]
             if len(day_attrs) < 2:
                 continue
             for i in range(len(day_attrs) - 1):
-                origin = day_attrs[i]
-                dest = day_attrs[i + 1]
-                origin_day = day_no
+                pairs.append((day_no, day_attrs[i], day_attrs[i + 1]))
 
-                try:
-                    route_info = await plan_driving_route(origin, dest)
-                    routes.append({
-                        "from": origin["name"],
-                        "to": dest["name"],
-                        # day：前端按天取路线时直接读这个字段，不再靠"起点名字属于哪天"反推。
-                        # 名字反推的隐患是重名景点（如两座城市都有"中山路"）或跨天复用同一个点。
-                        "day": origin_day,
-                        "from_coord": [origin["lng"], origin["lat"]],
-                        "to_coord": [dest["lng"], dest["lat"]],
-                        "distance": route_info.get("distance", 0),
-                        "duration": route_info.get("duration", 0),
-                        "polyline": route_info.get("polyline", [])
-                    })
-                    logger.debug("路线规划完成",
-                                 extra={"from": origin["name"], "to": dest["name"],
-                                        "distance_m": route_info.get("distance", 0),
-                                        "polyline_pts": len(route_info.get("polyline") or [])})
-                except Exception as e:
-                    logger.warning("路线规划失败",
-                                   extra={"from": origin["name"], "to": dest["name"],
-                                          "err": str(e)})
-                    routes.append({
-                        "from": origin["name"],
-                        "to": dest["name"],
-                        "day": origin_day,
-                        "from_coord": [origin["lng"], origin["lat"]],
-                        "to_coord": [dest["lng"], dest["lat"]],
-                        "distance": 0,
-                        "duration": 0,
-                        "polyline": []
-                    })
+        # 同样并发：段与段之间互不依赖，而每段是一次 HTTP 往返。
+        # gather 保序，routes 的顺序与"按天、天内按顺序"完全一致，前端不用改。
+        route_sem = asyncio.Semaphore(max(1, settings.map_concurrency))
+        routes = list(await asyncio.gather(*(
+            plan_segment(day_no, origin, dest, route_sem)
+            for day_no, origin, dest in pairs
+        )))
 
         existing_names = {a["name"] for a in attractions_with_coords}
 
