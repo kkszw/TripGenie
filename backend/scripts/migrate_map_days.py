@@ -171,7 +171,7 @@ def migrate_one(md: dict, plan: dict):
 
 async def rebuild_one(plan: dict):
     """按当前提示词重跑地图生成。只在 --rebuild 时调用。"""
-    from app.core.agents import generate_map_data
+    from app.services.map_data import generate_map_data
 
     days = plan.get("days") or []
     state = {

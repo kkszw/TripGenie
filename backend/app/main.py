@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.api import auth, chat, history
-from app.core.agents import ensure_tools
+from app.core.llm import ensure_tools
 from app.core.langgraph_app import get_workflow
 from app.core.checkpointer import get_checkpointer
 

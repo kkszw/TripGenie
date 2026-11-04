@@ -138,7 +138,13 @@
                     <div class="confirm-rows">
                       <div class="confirm-row">
                         <span class="confirm-label">目的地</span>
-                        <span class="confirm-value">{{ msg.interrupt.destination || '未指定' }}</span>
+                        <span class="confirm-value">
+                          {{ msg.interrupt.destination || '未指定' }}
+                          <!-- 只给了省份时，后端会按省内多个城市排；不说清楚就成了系统替他选了城市 -->
+                          <span v-if="msg.interrupt.destination_hint" class="confirm-hint">
+                            {{ msg.interrupt.destination_hint }}
+                          </span>
+                        </span>
                       </div>
                       <div class="confirm-row">
                         <span class="confirm-label">天数</span>
@@ -2104,6 +2110,16 @@ onUnmounted(() => {
   color: #2b3245;
   font-weight: 500;
   word-break: break-word;
+}
+
+/* 目的地行下方的补充说明：琥珀色而不是红色，是"提醒"不是"报错" */
+.confirm-hint {
+  display: block;
+  margin-top: 3px;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  color: #b06d12;
 }
 
 .confirm-actions {

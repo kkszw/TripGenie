@@ -152,17 +152,21 @@ TripGenie/
 │       │   └── history.py            # 会话 / 消息接口（按登录用户隔离）
 │       ├── core/
 │       │   ├── langgraph_app.py     # 工作流图定义
-│       │   ├── agents.py            # 各节点实现 + 地图数据生成
-│       │   ├── state.py             # TripState 状态定义
-│       │   ├── security.py          # 密码哈希、JWT、当前用户依赖
-│       │   ├── tools.py             # 自研工具（RAG 检索、天气）
-│       │   └── checkpointer.py      # LangGraph SQLite 检查点
+│       │   ├── nodes/                # 图上的节点，一个文件一个职责
+│       │   ├── prompts/              # 提示词，改文案只看这里
+│       │   ├── llm.py                # 模型实例与 MCP 工具加载
+│       │   ├── json_utils.py         # 模型输出的 JSON 容错解析
+│       │   ├── agents.py             # 兼容门面：只做再导出，新代码别往这加
+│       │   ├── state.py              # TripState 状态定义
+│       │   ├── security.py           # 密码哈希、JWT、当前用户依赖
+│       │   ├── tools.py              # 自研工具（RAG 检索、天气）
+│       │   └── checkpointer.py       # LangGraph SQLite 检查点
 │       ├── mcp/
-│       │   └── client.py            # MCP Server 接入与工具合并
+│       │   └── client.py             # MCP Server 接入与工具合并
 │       ├── rag/                     # 文档加载 / 分块 / 向量库 / 检索
-│       ├── services/                # SQLite 会话服务、天气服务
-│       ├── models/                  # 请求 / 响应模型
-│       └── data/                    # 攻略文档、向量库、城市编码表、会话数据库
+│       ├── services/                 # 会话库、天气、高德接口、地图数据、折线抽稀
+│       ├── models/                   # 请求 / 响应模型
+│       └── data/                     # 攻略文档、向量库、城市编码表、会话数据库
 └── frontend/
     ├── index.html
     ├── vite.config.js               # 含 /api 反向代理
