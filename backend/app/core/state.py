@@ -95,6 +95,9 @@ class TripState(TypedDict):
     plan_tips: NotRequired[List[str]]
     # review_error：质检自己挂了（LLM 超时/解析失败）。只告警，不阻断行程
     review_error: Optional[str]
+    # review_conflicts：用户约束自相矛盾之处（要求一天跨两城等）。
+    # 有值时直接放行——这类问题重排也解决不了——同时把矛盾写进 plan_tips 提示用户。
+    review_conflicts: NotRequired[List[str]]
     # 顺序节点（format_input / generate_plan）的失败原因
     error: Optional[str]
     # 三个并行节点的失败原因必须各用一个键：它们在同一 superstep 里执行，

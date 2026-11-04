@@ -127,9 +127,14 @@ async def classify_input(state: TripState):
     system_prompt = """
        你是一个意图分类器。分析用户输入，判断意图类型。
 
-       意图类型：
-       - chat: 闲聊、问候和调用单一工具解决用户问题（天气、景点、交通、美食等）
-       - format_input: 复杂任务（多天旅游规划、行程安排等）
+       - format_input：用户需要一份**行程**。只要表达了"想去某地玩、帮忙安排一下"的意思就归这里，
+         不管说了几天：一日游、周末、玩几天、没说具体天数、帮我排个行程、把第三天换成室内的，
+         全部算 format_input。天数/目的地没说清会有后续追问，不需要你在这里补齐。
+       - chat：不需要行程的对话。打招呼、闲聊、随口评价，以及问单个事实——
+         今天天气怎么样、某个景点门票多少、这儿有什么好吃的。
+
+       判断依据是"要不要排一天的安排"，不是"说了几天"。
+       拿不准时选 format_input：多问一句"玩几天"的代价，远小于把一份行程需求降级成闲聊。
        """
 
     messages = [
@@ -224,7 +229,8 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
         规则：
         1. 只输出用户本轮明确提到的字段；没提到的，destination 填空字符串、days 填 null、budget 填 null。
         2. days 必须是用户明确说过的天数，没提就填 null，不要默认成 3。
-        3. destination 用 省名+市名，例如 辽宁省大连市。
+        3. destination 用 省名+市名，例如 辽宁省大连市。用户只说了省份（"云南""四川"）
+           就填省份本身，不要因为填不出一座具体城市就留空——省份一样能规划。
         4. task_type 判断本轮和上一份行程的关系：
            - "modify"：在改/补充刚才的行程，包括"改成5天""换成便宜点的""对""3天"这类回答；
            - "new"：重新提出一次规划请求，例如"帮我规划个旅行""再给我排一版别的"。
@@ -725,6 +731,15 @@ REVIEW_RULE_TEXT = """
 6. 偏好冲突：偏好里写了"亲子"，却出现明显不适合的安排（酒吧、极限运动、深夜活动）。
 """
 
+# 用户约束本身自相矛盾时（要求一天跨两城、天数明显排不下指定路线），
+# 这不是行程的错：重排多少次都满足不了，只会白跑一次生成。
+# 这类情况单独走 conflicts 通道——直接放行，并把矛盾提示给用户。
+_CONFLICT_HINT = """
+例外（很重要）：如果问题的根子在用户的要求自相矛盾（例如要求"第二天去另一座城市"、
+同一天既要在一个城市又要出现在另一个城市、给的天数明显排不下指定的多个远方地点），
+那就不是行程写错了。不要把它写进 violations，改写进 conflicts，说明矛盾在哪里。
+"""
+
 # 餐饮/住宿/交通这类每天都有的安排，名字相似不算"重复景点"
 _NON_SPOT_HINTS = ("餐", "酒店", "入住", "住宿", "抵达", "返程", "出发", "机场", "高铁",
                    "车站", "交通", "休息", "自由活动")
@@ -804,33 +819,43 @@ def _review_prompt(state: TripState) -> str:
     days = state.get("draft_plan") or []
     city = _city_name(state.get("destination") or "")
     prefs = "、".join(state.get("preferences") or []) or "无特别偏好"
+    # 原始需求也要给它：否则它无从判断"串城"是行程写错，还是用户自己要求的
+    request = str(state.get("user_input") or "").strip()[:200] or "（未记录）"
     rules = REVIEW_RULE_TEXT.format(city=city)
     return (
         "你是行程质检员。下面是一份旅行行程，请只对照 2 条规则检查。\n\n"
+        f"用户原始需求：{request}\n"
         f"用户约束：\n- 目的地：{city}\n- 偏好：{prefs}\n\n"
         f"行程（JSON 数组，每个元素是一天）：\n{json.dumps(days, ensure_ascii=False)}\n\n"
         f"只有这 2 条算违规，rule 必须原样引用编号：{rules}\n"
+        f"{_CONFLICT_HINT}\n"
         "天数、预算、时段、重复景点已经由程序校验过，不要重复检查，也不要评论。\n"
         "不要评价：景点搭配是否合理、动线/路程赶不赶、值不值得去、时间是否“太满”、"
         "描述写得好不好、能不能更丰富。\n\n"
         "只输出 JSON（不要代码围栏，不要解释）：\n"
-        '{"violations": [{"rule": 2, "detail": "具体哪里不符"}], "feedback": "给规划师的具体修改指令"}\n'
+        '{"violations": [{"rule": 2, "detail": "具体哪里不符"}], '
+        '"conflicts": ["用户要求之间的矛盾，没有就留空数组"], '
+        '"feedback": "给规划师的具体修改指令"}\n'
         "只写确实违规的条目；检查后没问题的规则不要出现，更不要写“此项不违规”。"
-        "完全没有违规时必须输出 {\"violations\": [], \"feedback\": \"\"}。"
+        "什么都没发现时必须输出 "
+        '{"violations": [], "conflicts": [], "feedback": ""}。'
     )
 
 
-def _parse_violations(data: Dict) -> Tuple[List[str], bool, str]:
+def _parse_violations(data: Dict) -> Tuple[List[str], bool, str, List[str]]:
     """把模型输出收敛成"可信的违规项"。
 
     只保留 rule 在 REVIEW_RULES 里、detail 非空、且没有自证"不违规"的条目。
     实测模型会把"未超预算，此项不违规"也写进 violations，不滤掉就会白白重排。
+
+    conflicts 是"用户约束自相矛盾"的通道：一旦出现，直接放行，
+    因为这类问题改多少版行程都解决不了。放行的同时把矛盾原样带回去提示用户。
     """
     raw = data.get("violations")
     if raw is None:
         # 兼容旧格式：直接给 passed / issues
         issues = [str(i).strip() for i in (data.get("issues") or []) if str(i).strip()]
-        return issues, not issues, str(data.get("feedback") or "").strip()
+        return issues, not issues, str(data.get("feedback") or "").strip(), []
 
     issues: List[str] = []
     for item in raw or []:
@@ -848,8 +873,34 @@ def _parse_violations(data: Dict) -> Tuple[List[str], bool, str]:
             continue
         issues.append(f"[规则{rule_no}] {detail}")
 
+    conflicts = [str(c).strip() for c in (data.get("conflicts") or []) if str(c).strip()]
     feedback = str(data.get("feedback") or "").strip() or "；".join(issues)
-    return issues, not issues, feedback
+
+    if conflicts:
+        # 约束本身打架：报出来的 violations 多半是这个矛盾的副产品，
+        # 一起丢掉，否则会重排一次仍然不过，白烧一轮 token 和十几秒。
+        return [], True, feedback, conflicts
+
+    return issues, not issues, feedback, conflicts
+
+
+def _merge_plan_tips(state: TripState, conflicts: List[str]) -> None:
+    """把"约束自相矛盾"的提示并进行程 tips。
+
+    tips 会随 trip_plan 推给前端并落库，用户能在行程卡片上直接看到；
+    只写进日志的话，他只会觉得系统擅自忽略了他提的要求。
+    """
+    tips = list(state.get("plan_tips") or [])
+    for item in conflicts:
+        text = str(item).strip()
+        if not text:
+            continue
+        if len(text) > 80:
+            text = text[:78] + "…"
+        line = f"⚠️ 你的要求之间有冲突：{text}"
+        if line not in tips:
+            tips.append(line)
+    state["plan_tips"] = tips
 
 
 async def review_plan_node(state: TripState, config: RunnableConfig = None) -> TripState:
@@ -873,7 +924,7 @@ async def review_plan_node(state: TripState, config: RunnableConfig = None) -> T
             "message": "正在核对行程是否满足约束..."
         })
 
-    passed, issues, feedback = True, [], ""
+    passed, issues, feedback, conflicts = True, [], "", []
     days = state.get("draft_plan") or []
 
     if days:
@@ -892,10 +943,18 @@ async def review_plan_node(state: TripState, config: RunnableConfig = None) -> T
                 content = resp.content
                 if isinstance(content, list):
                     content = " ".join(str(item) for item in content)
-                issues, passed, feedback = _parse_violations(parse_llm_json(content))
+                issues, _, feedback, conflicts = _parse_violations(parse_llm_json(content))
             except Exception as e:
                 print(f"⚠️ 质检失败，这一版直接放行: {e}")
                 state["review_error"] = f"行程质检失败: {e}"
+
+        if conflicts:
+            # 用户的要求自己打架（要求同一天跨两城之类）。这是需求的问题，不是行程的问题，
+            # 重排一次也变不出来，直接放行并把矛盾告诉用户。
+            issues = []
+            _merge_plan_tips(state, conflicts)
+            state["review_conflicts"] = conflicts
+            print(f"🧐 用户约束互相冲突，放行并提示：{conflicts}")
 
         passed = not issues
 
