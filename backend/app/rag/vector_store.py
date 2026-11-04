@@ -8,8 +8,11 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
 from app.config import settings
+from app.core.logging import get_logger
 from app.rag.embeddings import get_embeddings
 from app.utils.path_tool import get_absolute_path
+
+logger = get_logger(__name__)
 
 # 进程内单例。原来每次 get_vector_store() 都 new 一个 Chroma：重新打开 sqlite、
 # 重新加载 collection，实测单次 0.98s；缓存后 0.27s。而一个规划请求会调两次
@@ -51,8 +54,9 @@ def add_documents(documents: List[Document]):
     """添加文档到向量库"""
     vector_store = get_vector_store()
     vector_store.add_documents(documents)
-    print(f"✅ 添加 {len(documents)} 个文档块到向量库")
-    print(f"📁 存储路径: {get_absolute_path(settings.chroma_db_path)}")
+    logger.info("向量库写入完成",
+                extra={"chunks": len(documents),
+                       "path": get_absolute_path(settings.chroma_db_path)})
 
 
 def get_retriever(top_k: int = 5):
@@ -75,7 +79,5 @@ def get_collection_stats():
     vector_store = get_vector_store()
     collection = vector_store._collection
     count = collection.count()
-    print(f"📊 向量库统计:")
-    print(f"  集合名称: {collection.name}")
-    print(f"  文档数量: {count}")
+    logger.info("向量库统计", extra={"collection": collection.name, "documents": count})
     return count

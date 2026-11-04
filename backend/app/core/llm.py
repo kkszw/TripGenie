@@ -9,8 +9,11 @@ import asyncio
 from langchain_openai import ChatOpenAI
 
 from app.config import settings
+from app.core.logging import get_logger
 from app.core.state import IntentOutput
 from app.mcp.client import getAllTools
+
+logger = get_logger(__name__)
 
 #
 # DeepSeek 走 OpenAI 兼容端点，所以统一用 ChatOpenAI 指向它，换供应商只改 .env。
@@ -84,4 +87,4 @@ async def ensure_tools():
             return
         await initialized_tools()
         _tools_ready = True
-        print(f"🔧 MCP 工具初始化完成: {len(tools)} 个")
+        logger.info("MCP 工具初始化完成", extra={"count": len(tools)})

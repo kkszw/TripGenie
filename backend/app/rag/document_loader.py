@@ -9,6 +9,10 @@ from langchain_core.documents import Document
 import re
 import os
 
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 def load_and_split_pdf(
         pdf_path: str,
@@ -30,7 +34,8 @@ def load_and_split_pdf(
     loader = PyPDFLoader(pdf_path)
     documents = loader.load()
 
-    print(f"📄 加载 PDF: {pdf_path}, 共 {len(documents)} 页")
+    logger.debug("PDF 已解析", extra={"file": os.path.basename(pdf_path),
+                                    "pages": len(documents)})
 
     # 2. 分块
     text_splitter = RecursiveCharacterTextSplitter(
@@ -47,7 +52,7 @@ def load_and_split_pdf(
         chunk.metadata["source"] = Path(pdf_path).name
         chunk.metadata["page"] = chunk.metadata.get("page", 0)
 
-    print(f"📦 分块完成: 共 {len(chunks)} 个块")
+    logger.debug("分块完成", extra={"chunks": len(chunks)})
     return chunks
 
 
@@ -143,7 +148,7 @@ def load_pdf_advanced(pdf_path: str) -> List[Document]:
     # 智能分块
     documents = smart_chunking(full_text, os.path.basename(pdf_path))
 
-    print(f"📄 成功加载 {len(documents)} 个文档块")
+    logger.debug("PDF 加载完成", extra={"chunks": len(documents)})
     return documents
 
 
@@ -317,9 +322,9 @@ class MarkdownLoader:
             try:
                 docs = self.load_markdown(str(file_path))
                 all_docs.extend(docs)
-                print(f"✅ 加载: {file_path.name} → {len(docs)} 个块")
+                logger.debug("文档已加载", extra={"file": file_path.name, "chunks": len(docs)})
             except Exception as e:
-                print(f"❌ 加载失败: {file_path.name}, {e}")
+                logger.warning("文档加载失败", extra={"file": file_path.name, "err": str(e)})
 
         return all_docs
 

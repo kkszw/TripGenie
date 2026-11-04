@@ -7,8 +7,11 @@ from langchain_core.runnables import RunnableConfig
 
 from app.core import llm as llm_runtime
 from app.core.json_utils import parse_llm_json
+from app.core.logging import get_logger
 from app.core.prompts import build_plan_prompt
 from app.core.state import TripState
+
+logger = get_logger(__name__)
 
 
 def format_response(plan_data: dict) -> str:
@@ -74,7 +77,7 @@ async def generate_plan_node(state: TripState, config: RunnableConfig = None) ->
 
     try:
         data = parse_llm_json(full_response)
-        print("✅ JSON 解析成功")
+        logger.debug("行程 JSON 解析成功", extra={"chars": len(full_response)})
 
         state["draft_plan"] = data.get("days", [])
         state["plan_tips"] = data.get("tips") or []

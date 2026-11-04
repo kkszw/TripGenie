@@ -3,8 +3,11 @@
 from langchain_core.runnables import RunnableConfig
 
 from app.core import llm as llm_runtime
+from app.core.logging import get_logger
 from app.core.state import TripState
 from app.services.map_data import generate_map_data
+
+logger = get_logger(__name__)
 
 
 async def generate_map_node(state: TripState, config: RunnableConfig = None) -> TripState:
@@ -39,10 +42,11 @@ async def generate_map_node(state: TripState, config: RunnableConfig = None) -> 
         map_data = await generate_map_data(state, plan_data)
         if map_data:
             state["map_data"] = map_data
-            print(f"✅ 地图数据生成成功: {len(map_data.get('attractions', []))} 个景点")
+            logger.debug("地图数据已写入 state",
+                         extra={"attractions": len(map_data.get('attractions', []))})
     except Exception as e:
         state["error"] = f"生成地图失败: {e}"
-        print(f"❌ 生成地图失败: {e}")
+        logger.exception("生成地图失败", extra={"err": str(e)})
 
     state["current_step"] = "generate_map"
     if writer:

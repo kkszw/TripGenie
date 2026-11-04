@@ -156,6 +156,8 @@ TripGenie/
 │       │   ├── prompts/              # 提示词，改文案只看这里
 │       │   ├── llm.py                # 模型实例与 MCP 工具加载
 │       │   ├── json_utils.py         # 模型输出的 JSON 容错解析
+│       │   ├── logging.py            # 结构化日志 + trace_id 上下文
+│       │   ├── metrics.py            # 节点耗时 / token / 工具调用统计
 │       │   ├── agents.py             # 兼容门面：只做再导出，新代码别往这加
 │       │   ├── state.py              # TripState 状态定义
 │       │   ├── security.py           # 密码哈希、JWT、当前用户依赖
@@ -231,6 +233,10 @@ cp .env.example .env          # Windows: copy .env.example .env
 | `WEATHER_API_KEY` | 天气接口（可不填，天气节点失败不影响主流程） |
 | `UVX_PATH` | uvx 可执行文件路径。**留空则自动探测** PATH 与当前虚拟环境 |
 | `JWT_SECRET` | 登录令牌签名密钥。**必须固定一个随机串**，否则每次重启都会把所有人踢下线 |
+| `LOG_LEVEL` | 日志级别，默认 `INFO`。排查细节时改 `DEBUG`（能看到每个景点的地理编码过程） |
+| `LOG_DIR` | 日志目录，留空用 `backend/logs`（已在 `.gitignore` 里） |
+| `RUN_LOG_ENABLED` | 是否把每次运行的摘要追加到 `logs/runs.jsonl`，默认 `true` |
+| `DEEPSEEK_INPUT_PRICE` / `DEEPSEEK_OUTPUT_PRICE` | 模型单价（元 / 百万 token），**仅用于把 token 折算成金额**。留 0 就只统计 token |
 
 > 生成 `JWT_SECRET`：`python -c "import secrets; print(secrets.token_urlsafe(48))"`，粘进 `.env` 即可。留空也能启动，但服务会用临时密钥并在控制台打印告警。
 
@@ -333,6 +339,62 @@ python evals/run_evals.py --limit 3          # 冒烟
 拿它做回归要注意：LLM 有波动，单次失败不等于退化。实测同一批用例在不同运行里失败位置会漂移，所以通过线定在 90%——判断有没有退化，看连续两次的结果，别被一次红字带着走。
 
 ---
+
+## 日志与度量
+
+### 每次请求一个 trace_id
+
+入口生成 8 位短码，通过 SSE 首帧下发给前端，同时写进本次请求的**每一行**日志。用户说"刚才失败了"时，让他报这个码，`grep` 一次就能捞出这次运行的完整过程：
+
+```
+18:40:12 INFO  [manual01b] services.map_data 坐标获取完成 total=11 precise=11 approx=0
+18:40:14 INFO  [manual01b] api.chat 行程就绪 days=2 has_map=True
+18:40:14 INFO  [manual01b] core.metrics 运行结束 generate_map=16.2s generate_plan=7.6s
+                                  get_weather=3.0s status=ok total_ms=27738 llm_calls=4 tokens=7330+1505
+```
+
+控制台是给人看的彩色行，`logs/app.log` 是 JSON Lines 给机器查（按天轮转，保留 7 天）。
+
+实现上必须用 `contextvars` 而不是模块级全局变量：SSE 是异步的，一次请求横跨多个 `await`，全局变量在并发下必然串号。三个字段（trace / thread / user）由 Formatter 自动注入，业务代码不用到处传参——这也是为什么 100 多处 `print` 换掉之后，调用点不需要改签名。
+
+### 每次运行一行摘要
+
+`logs/runs.jsonl`，一行一个 JSON：
+
+```json
+{"trace": "manual01b", "status": "ok", "total_ms": 27739.8,
+ "nodes": {"generate_map": {"ms": 16234, "pct": 58.5}, "generate_plan": {"ms": 7561, "pct": 27.3}},
+ "llm": {"calls": 4, "input_tokens": 7330, "output_tokens": 1505, "by_node": {...}},
+ "tools": {"maps_geo": 12, "get_weather": 1},
+ "extra": {"destination": "山东省青岛市", "days": 2}}
+```
+
+`status` 区分 `ok` / `interrupted`（等用户确认）/ `cancelled`（客户端断开）/ `failed`，四种出口都落盘——中断和取消是 `return` / `raise` 出去的，所以收尾放在 `finally` 里，少写一处就没有数据。
+
+### 这套东西测出来的第一件事
+
+一次"青岛两天"的实测分布：
+
+| 节点 | 耗时 | 占比 |
+|---|---|---|
+| generate_map | 16.2s | 58.5% |
+| generate_plan | 7.6s | 27.3% |
+| get_weather | 3.0s | 10.7% |
+| 其余 4 个节点合计 | 2.5s | 9% |
+
+LLM 4 次调用、7330 + 1505 token，外部工具 13 次（12 次地理编码 + 1 次天气）。
+
+结论很直接：**六成时间在地图节点，而它是十几次串行的高德 HTTP 调用**。这个数字以前只能靠临时脚本才测得出来，现在改任何东西跑一次就能对比。
+
+### 取舍
+
+- **不引 OpenTelemetry / Prometheus**：单进程、只想回答"这一次跑得怎么样"，攒在内存里结束时写一行 JSON，比拉一套 collector + exporter 直接。真要接链路追踪，`trace` 就是现成的锚点。
+- **成本单价放配置不写死**：模型价格会变，写死在代码里就是定时炸弹。留 0 则只统计 token 不折算金额。
+- **`scripts/` 和 `evals/` 的 `print` 保留**：那些是给人手动跑的进度条，变成日志反而难读。
+- **`logs/` 不进仓库**：已在 `.gitignore`。
+
+---
+
 
 ## API 接口
 

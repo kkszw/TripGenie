@@ -23,6 +23,9 @@ from app.core.nodes import (
 )
 from app.core.state import TripState
 from app.core.checkpointer import get_checkpointer
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 _workflow = None
 _workflow_lock = asyncio.Lock()
@@ -97,5 +100,5 @@ async def get_workflow():
         async with _workflow_lock:
             if _workflow is None:
                 _workflow = await create_workflow()
-                print("✅ 工作流编译完成")
+                logger.info("工作流编译完成")
     return _workflow

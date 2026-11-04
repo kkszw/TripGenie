@@ -7,7 +7,10 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END
 
 from app.core import llm as llm_runtime
+from app.core.logging import get_logger
 from app.core.state import TripState
+
+logger = get_logger(__name__)
 
 
 async def chat(state: TripState, config: RunnableConfig = None):
@@ -59,17 +62,19 @@ async def tool_node(state: TripState):
         return {"response": "没有工具调用"}
 
     tool_calls = last_message.tool_calls
-    print(f"🔧 需要执行 {len(tool_calls)} 个工具调用")
+    logger.info("执行工具调用", extra={"count": len(tool_calls),
+                                    "tools": [t["name"] for t in tool_calls]})
 
     results = []
 
     for i, tool_call in enumerate(tool_calls):
-        print(f"🔧 执行工具 {i + 1}/{len(tool_calls)}: {tool_call['name']}")
+        logger.debug("执行工具", extra={"idx": f"{i + 1}/{len(tool_calls)}",
+                                     "tool": tool_call["name"]})
 
         tool = llm_runtime.tools_by_name.get(tool_call["name"])
         if not tool:
             error_msg = f"工具 {tool_call['name']} 不存在"
-            print(f"❌ {error_msg}")
+            logger.warning("工具不存在", extra={"tool": tool_call["name"]})
             results.append(ToolMessage(
                 content=error_msg,
                 tool_call_id=tool_call["id"]
@@ -79,13 +84,15 @@ async def tool_node(state: TripState):
         try:
             # 执行工具
             if hasattr(tool, 'ainvoke'):
-                print(f"参数为：{tool_call['args']}")
+                logger.debug("工具参数", extra={"tool": tool_call["name"],
+                                             "arguments": tool_call["args"]})
                 result = await tool.ainvoke(tool_call["args"])
             else:
-                print(f"参数为：{tool_call['args']}")
+                logger.debug("工具参数", extra={"tool": tool_call["name"],
+                                             "arguments": tool_call["args"]})
                 result = tool.invoke(tool_call["args"])
 
-            print(f"✅ 工具 {i + 1} 执行完成")
+            logger.debug("工具执行完成", extra={"tool": tool_call["name"]})
 
             results.append(ToolMessage(
                 content=str(result) if result else "执行完成",
@@ -94,7 +101,7 @@ async def tool_node(state: TripState):
 
         except Exception as e:
             error_msg = f"工具执行失败: {str(e)}"
-            print(f"❌ {error_msg}")
+            logger.warning("工具执行失败", extra={"tool": tool_call["name"], "err": str(e)})
             results.append(ToolMessage(
                 content=error_msg,
                 tool_call_id=tool_call["id"]
@@ -111,14 +118,14 @@ async def tool_node(state: TripState):
         )
         final_content = final_response.content if hasattr(final_response, 'content') else str(final_response)
 
-        print(f"📝 最终回复: {final_content[:100]}...")
+        logger.debug("最终回复", extra={"chars": len(final_content)})
 
         return {
             "messages": results + [AIMessage(content=final_content)],
             "response": final_content
         }
     except Exception as e:
-        print(f"❌ 生成最终回复失败: {e}")
+        logger.exception("生成最终回复失败", extra={"err": str(e)})
         # 如果生成失败，合并工具结果
         tool_results = "\n".join([r.content for r in results if r.content])
         return {
@@ -135,6 +142,6 @@ def should_continue(state: TripState) -> Literal["tool_node", END]:
     last_message = messages[-1]
     # 检查是否有工具调用
     if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-        print(f"下一个节点是工具节点 (有 {len(last_message.tool_calls)} 个工具调用)")
+        logger.debug("路由到工具节点", extra={"tool_calls": len(last_message.tool_calls)})
         return "tool_node"
     return END

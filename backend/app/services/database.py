@@ -6,7 +6,10 @@ from datetime import datetime
 from typing import List, Optional, Dict
 
 from app.config import settings
+from app.core.logging import get_logger
 from app.utils.path_tool import get_absolute_path
+
+logger = get_logger(__name__)
 
 
 class DatabaseService:
@@ -32,7 +35,7 @@ class DatabaseService:
         db_dir = self.db_path.parent
         if not db_dir.exists():
             db_dir.mkdir(parents=True, exist_ok=True)
-            print(f"✅ 创建数据库目录: {db_dir}")
+            logger.debug("创建数据库目录", extra={"path": str(db_dir)})
 
         # 建表必须无条件执行。CREATE TABLE IF NOT EXISTS 本身是幂等的，而一旦把建表
         # 塞进上面的 if 里，"目录存在但表不存在"的情况（只删了 sessions.db、或 clone
@@ -83,7 +86,7 @@ class DatabaseService:
         columns = [row[1] for row in cursor.fetchall()]
         if "map_data" not in columns:
             cursor.execute("ALTER TABLE messages ADD COLUMN map_data TEXT")
-            print("✅ 已自动添加 map_data 字段")
+            logger.info("已自动为 messages 表添加 map_data 字段")
 
         # 3. 创建索引（提高查询性能）
         cursor.execute("""
@@ -102,7 +105,7 @@ class DatabaseService:
 
         conn.commit()
         conn.close()
-        print("✅ 数据库初始化完成")
+        logger.info("数据库初始化完成", extra={"path": str(self.db_path)})
 
     # ==================== 用户操作 ====================
 
@@ -165,7 +168,7 @@ class DatabaseService:
                            VALUES (?, ?, ?, ?, ?)
                            """, (thread_id, user_id, name, now, now))
             conn.commit()
-            print("会话创建成功")
+            logger.debug("会话已创建", extra={"thread_id": thread_id, "user_id": user_id})
             return {
                 "thread_id": thread_id,
                 "user_id": user_id,
@@ -224,7 +227,7 @@ class DatabaseService:
         affected = cursor.rowcount
         conn.commit()
         conn.close()
-        print("会话名称更新成功")
+        logger.debug("会话名称已更新", extra={"thread_id": thread_id})
         return affected > 0
 
     def delete_session(self, thread_id: str) -> bool:
@@ -236,7 +239,7 @@ class DatabaseService:
         affected = cursor.rowcount
         conn.commit()
         conn.close()
-        print("会话删除成功")
+        logger.debug("会话已删除", extra={"thread_id": thread_id})
         return affected > 0
 
     # ==================== 消息操作 ====================

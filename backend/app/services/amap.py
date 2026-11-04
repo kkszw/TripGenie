@@ -14,8 +14,11 @@ import httpx
 
 from app.config import settings
 from app.core.json_utils import as_number
+from app.core.logging import get_logger
 from app.services.geo import Region
 from app.services.polyline import simplify_polyline
+
+logger = get_logger(__name__)
 
 AMAP_PLACE_TEXT_URL = "https://restapi.amap.com/v3/place/text"
 AMAP_DRIVING_URL = "https://restapi.amap.com/v3/direction/driving"
@@ -84,11 +87,13 @@ async def poi_search_rest(name: str, region: "Region") -> Optional[Dict]:
             resp = await client.get(AMAP_PLACE_TEXT_URL, params=params)
             data = resp.json()
     except Exception as e:
-        print(f"  ⚠️ POI 搜索请求失败: {e}")
+        logger.warning("POI 搜索请求失败", extra={"poi": name, "err": str(e)})
         return None
 
     if str(data.get("status")) != "1":
-        print(f"  ⚠️ POI 搜索返回异常: {data.get('info')} ({data.get('infocode')})")
+        logger.warning("POI 搜索返回异常",
+                       extra={"poi": name, "info": data.get("info"),
+                              "infocode": data.get("infocode")})
         return None
 
     pois = data.get("pois") or []
@@ -99,8 +104,9 @@ async def poi_search_rest(name: str, region: "Region") -> Optional[Dict]:
     if not best:
         return None
     lng_str, lat_str = best["location"].split(",")[:2]
-    print(f"  🔎 POI 搜索命中: {best.get('name')!r} "
-          f"({best.get('adname') or ''}) -> {lng_str},{lat_str}")
+    logger.debug("POI 搜索命中",
+                 extra={"query": name, "hit": best.get("name"),
+                        "district": best.get("adname"), "coord": f"{lng_str},{lat_str}"})
     return {"lng": float(lng_str), "lat": float(lat_str)}
 
 
@@ -195,10 +201,11 @@ def parse_route_result(result: Any) -> Dict:
     empty = {"distance": 0, "duration": 0, "polyline": []}
     payload = unwrap_mcp_result(result)
     if not isinstance(payload, dict):
-        print(f"  ⚠️ 路线结果无法解析（{type(result).__name__}）: {str(result)[:200]}")
+        logger.warning("路线结果无法解析",
+                       extra={"type": type(result).__name__, "head": str(result)[:200]})
         return empty
     if payload.get("error"):
-        print(f"  ⚠️ 路线接口报错: {payload['error']}")
+        logger.warning("路线接口报错", extra={"error": payload["error"]})
         return empty
 
     route = payload.get("route") if isinstance(payload.get("route"), dict) else payload
@@ -206,7 +213,7 @@ def parse_route_result(result: Any) -> Dict:
     if not paths and ("path" in route or "distance" in route):
         paths = [route]
     if not paths:
-        print(f"  ⚠️ 路线结果里没有 paths，字段: {list(payload)[:8]}")
+        logger.warning("路线结果里没有 paths", extra={"keys": list(payload)[:8]})
         return empty
 
     path = paths[0]
@@ -228,7 +235,8 @@ def parse_route_result(result: Any) -> Dict:
                 polyline.append(point)
 
     if not polyline:
-        print(f"  ⚠️ 拿到距离 {distance}m 但没有折线，可用字段: {list(path)[:8]}")
+        logger.warning("拿到距离但没有折线，前端画不出这段路线",
+                       extra={"distance_m": distance, "path_keys": list(path)[:8]})
 
     # 抽稀：这段折线接着会进 SSE、进 SQLite 历史，还要供下次回放。
     # 原始 200~400 点在屏幕上看不出区别，按 6 米容差压到几十点，
@@ -241,7 +249,8 @@ def parse_route_result(result: Any) -> Dict:
             max_points=settings.map_polyline_max_points,
         )
         if raw_count >= 100:
-            print(f"  ✂️ 折线抽稀 {raw_count} → {len(polyline)} 点")
+            logger.debug("折线抽稀", extra={"before": raw_count, "after": len(polyline),
+                                         "ratio": f"{len(polyline) / raw_count:.0%}"})
 
     return {"distance": distance, "duration": duration, "polyline": polyline}
 
@@ -278,14 +287,16 @@ async def driving_route_rest(origin: Dict, dest: Dict) -> Optional[Dict]:
                 resp = await client.get(AMAP_DRIVING_URL, params=params)
                 data = resp.json()
         except Exception as e:
-            print(f"  ⚠️ 驾车路线 REST 请求失败: {e}")
+            logger.warning("驾车路线 REST 请求失败", extra={"err": str(e)})
             data = {}
         if str(data.get("status")) == "1":
             break
         if str(data.get("infocode")) == "10021" and attempt < 2:
+            logger.debug("高德 QPS 超限，退避重试", extra={"attempt": attempt + 1})
             await asyncio.sleep(0.5 * (attempt + 1))
             continue
-        print(f"  ⚠️ 驾车路线 REST 返回异常: {data.get('info')} ({data.get('infocode')})")
+        logger.warning("驾车路线 REST 返回异常",
+                       extra={"info": data.get("info"), "infocode": data.get("infocode")})
         return None
 
     if str(data.get("status")) != "1":
@@ -320,7 +331,7 @@ async def plan_driving_route(origin: Dict, dest: Dict) -> Dict:
                 info["distance"] = info.get("distance") or mcp_info["distance"]
                 info["duration"] = info.get("duration") or mcp_info["duration"]
         except Exception as e:
-            print(f"  ⚠️ MCP 备用路线也失败: {e}")
+            logger.warning("MCP 备用路线也失败", extra={"err": str(e)})
 
     return info or {"distance": 0, "duration": 0, "polyline": []}
 
@@ -400,7 +411,7 @@ def parse_coordinates(result, allow_admin: bool = False) -> Dict:
                 return coords
 
     except Exception as e:
-        print(f"解析坐标失败: {e}")
+        logger.warning("解析坐标失败", extra={"err": str(e)})
 
     return {}
 
@@ -418,8 +429,9 @@ def extract_location_from_dict(data, allow_admin: bool = False) -> Dict:
             if returns and len(returns) > 0:
                 item = returns[0]
                 if not allow_admin and _is_admin_level(item):
-                    print(f"   ⚠️ 只定位到行政区（level={item.get('level')!r}, "
-                          f"district={item.get('district')}），这个坐标不是景点，丢弃")
+                    logger.debug("只定位到行政区，坐标不是景点，丢弃",
+                                 extra={"level": item.get("level"),
+                                        "district": item.get("district")})
                     return {}
                 loc = item.get("location", "")
                 if loc and "," in loc:
@@ -444,7 +456,7 @@ def extract_location_from_dict(data, allow_admin: bool = False) -> Dict:
                     parts = loc.split(",")
                     return {"lng": float(parts[0]), "lat": float(parts[1])}
     except Exception as e:
-        print(f"extract_location_from_dict 异常: {e}")
+        logger.warning("extract_location_from_dict 异常", extra={"err": str(e)})
     return {}
 
 
@@ -460,5 +472,5 @@ def extract_location_from_text(text: str) -> Dict:
         if match:
             return {"lng": float(match.group(1)), "lat": float(match.group(2))}
     except Exception as e:
-        print(f"extract_location_from_text 异常: {e}")
+        logger.warning("extract_location_from_text 异常", extra={"err": str(e)})
     return {}

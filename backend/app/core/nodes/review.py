@@ -19,8 +19,11 @@ from langchain_core.runnables import RunnableConfig
 
 from app.core import llm as llm_runtime
 from app.core.json_utils import parse_llm_json
+from app.core.logging import get_logger
 from app.core.prompts import build_review_prompt
 from app.core.state import TripState
+
+logger = get_logger(__name__)
 
 # 最多重排几次。1 次 ≈ 最坏多花一次生成 + 一次质检；再多对体验帮助很小，
 # 反而把"旅行规划"拖成一分钟的等待。
@@ -219,7 +222,7 @@ async def review_plan_node(state: TripState, config: RunnableConfig = None) -> T
                     content = " ".join(str(item) for item in content)
                 issues, _, feedback, conflicts = parse_violations(parse_llm_json(content))
             except Exception as e:
-                print(f"⚠️ 质检失败，这一版直接放行: {e}")
+                logger.warning("质检失败，这一版直接放行", extra={"err": str(e)})
                 state["review_error"] = f"行程质检失败: {e}"
 
         if conflicts:
@@ -228,7 +231,7 @@ async def review_plan_node(state: TripState, config: RunnableConfig = None) -> T
             issues = []
             merge_plan_tips(state, conflicts)
             state["review_conflicts"] = conflicts
-            print(f"🧐 用户约束互相冲突，放行并提示：{conflicts}")
+            logger.info("用户约束互相冲突，放行并提示", extra={"conflicts": conflicts})
 
         passed = not issues
 
@@ -238,9 +241,10 @@ async def review_plan_node(state: TripState, config: RunnableConfig = None) -> T
 
     if not passed:
         state["review_round"] = (state.get("review_round") or 0) + 1
-        print(f"🧐 质检未通过（第 {state['review_round']} 次重排）：{issues}")
+        logger.warning("质检未通过，准备重排",
+                       extra={"round": state["review_round"], "issues": issues})
     else:
-        print("🧐 质检通过")
+        logger.debug("质检通过")
 
     state["current_step"] = "review_plan"
     if writer:
@@ -261,6 +265,6 @@ def route_after_review(state: TripState) -> List[str]:
     if state.get("review_passed"):
         return ["generate_map"]
     if (state.get("review_round") or 0) > REVIEW_MAX_ROUNDS:
-        print("🧐 重排次数已用尽，按这一版交付")
+        logger.warning("重排次数已用尽，按这一版交付")
         return ["generate_map"]
     return ["generate_plan"]

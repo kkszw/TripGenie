@@ -7,8 +7,11 @@ from langchain_core.runnables import RunnableConfig
 
 from app.core import llm as llm_runtime
 from app.core.json_utils import as_number, parse_llm_json
+from app.core.logging import get_logger
 from app.core.prompts import build_format_prompt, clarify_text
 from app.core.state import TripState
+
+logger = get_logger(__name__)
 
 # 用户明确表示"不要之前那个城市"的说法。这类话里没有地名，LLM 抽不出 destination，
 # 但如果上一步正在沿用历史目的地，就会变成"用户想换、系统还按老城市排"。
@@ -83,7 +86,7 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
     dest_explicit = False   # 本轮输入里是否真的出现了目的地
     modifying = False       # 本轮是在修改上一份行程 / 回答追问，而不是开新任务
     try:
-        print(f"📄 format_input 提取的 JSON: {content}")
+        logger.debug("槽位抽取结果", extra={"raw": content})
         data = parse_llm_json(content)
         modifying = str(data.get("task_type") or "").strip().lower() == "modify"
 
@@ -104,7 +107,7 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
         state["start_date"] = data.get("start_date") or data.get("start_data") or state.get("start_date")
     except Exception as e:
         state["error"] = "解析用户输入失败"
-        print(f"format_input错误：{e}")
+        logger.warning("槽位抽取解析失败", extra={"err": str(e)})
 
     # 用户说"换个城市"却没点名：不能顺着老目的地继续排，清掉让它变成真正的追问
     if not dest_explicit and _wants_other_city(state.get("user_input")):
@@ -153,7 +156,7 @@ async def clarify(state: TripState) -> TripState:
         days=state.get("days"),
     )
 
-    print(f"❓ clarify 追问：missing={missing} -> {question}")
+    logger.info("信息不足，发起追问", extra={"missing": missing})
     state["clarify_question"] = question
     state["response"] = question
     state["current_step"] = "clarify"

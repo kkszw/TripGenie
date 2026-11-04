@@ -8,6 +8,11 @@ from app.api import auth, chat, history
 from app.core.llm import ensure_tools
 from app.core.langgraph_app import get_workflow
 from app.core.checkpointer import get_checkpointer
+from app.core.logging import adopt_uvicorn_loggers, get_logger, setup_logging
+
+# 尽量早：之后任何模块第一行日志都能落文件、带 trace_id
+setup_logging()
+logger = get_logger(__name__)
 
 app = FastAPI(
     title="TripGenie API",
@@ -43,10 +48,14 @@ async def startup():
         try:
             await ensure_tools()
         except Exception as e:
-            print(f"⚠️ MCP 工具预热失败（不影响启动，首次用到工具时会重试）: {e}")
+            logger.warning("MCP 工具预热失败（不影响启动，首次用到工具时会重试）",
+                           extra={"err": str(e)})
 
     asyncio.create_task(_warmup_tools())
-    print("✅ TripGenie API 启动成功!")
+    # uvicorn 在启动时给自己的 logger 单独挂了 handler，摘掉才能让它的
+    # 启动/报错日志也走我们的格式（带 trace_id、同时落文件）
+    adopt_uvicorn_loggers()
+    logger.info("TripGenie API 启动完成")
 
 
 @app.get("/")

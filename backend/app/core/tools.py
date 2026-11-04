@@ -1,6 +1,9 @@
 # author: szw
 from langchain.tools import tool
+from app.core.logging import get_logger
 from app.rag.retriever import retrieve_context
+
+logger = get_logger(__name__)
 
 @tool("retrieve_guides")
 async def retrieve_guides_tool(query: str) -> str:
@@ -32,5 +35,5 @@ async def get_weather_tool(city_name: str) -> str:
             return str(weather_data)
 
     except Exception as e:
-        print(f"❌ 天气查询失败: {e}")
+        logger.warning("天气查询失败", extra={"err": str(e)})
         return f"查询天气失败：{str(e)}"

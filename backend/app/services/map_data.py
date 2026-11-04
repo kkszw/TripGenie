@@ -6,16 +6,18 @@
 """
 import json
 import math
-import traceback
 from typing import Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage
 
 from app.config import settings
 from app.core import llm as llm_runtime
+from app.core.logging import get_logger
 from app.core.prompts import build_attraction_prompt
 from app.services.amap import parse_coordinates, plan_driving_route, poi_search_rest
 from app.services.geo import Region, is_offset_ok, parse_region
+
+logger = get_logger(__name__)
 
 
 def build_plan_text(destination: str, plan_data: dict) -> str:
@@ -40,7 +42,7 @@ async def extract_attractions_with_llm(destination: str, plan_data: dict) -> Lis
     prompt = build_attraction_prompt(build_plan_text(destination, plan_data))
 
     try:
-        print("🤖 使用 LLM 提取景点...")
+        logger.debug("开始用 LLM 提取景点")
         # 用 llm_extract（streaming=False）：这里的输出是给程序看的中转数据，
         # 不能进 SSE 正文，否则会跟在行程 JSON 后面一起推给前端。
         # internal 是第二道保险：万一以后有人图省事又改回 llm，api/chat.py 看到
@@ -50,7 +52,7 @@ async def extract_attractions_with_llm(destination: str, plan_data: dict) -> Lis
         )
         content = response.content
 
-        print(f"LLM 响应: {content[:20]}...")
+        logger.debug("景点提取响应", extra={"chars": len(content)})
 
         # 提取 JSON：优先抓 ```json 围栏，否则退化成最外层大括号
         import re
@@ -62,7 +64,7 @@ async def extract_attractions_with_llm(destination: str, plan_data: dict) -> Lis
             if json_match:
                 json_str = json_match.group()
             else:
-                print("❌ 无法从 LLM 响应中提取 JSON")
+                logger.warning("无法从 LLM 响应中提取 JSON", extra={"head": content[:120]})
                 return []
 
         data = json.loads(json_str)
@@ -83,12 +85,11 @@ async def extract_attractions_with_llm(destination: str, plan_data: dict) -> Lis
         # 过滤空名称
         result = [a for a in result if a["name"]]
 
-        print(f"✅ LLM 提取到 {len(result)} 个景点: {[a['name'] for a in result]}")
+        logger.info("景点提取完成", extra={"count": len(result)})
         return result
 
     except Exception as e:
-        print(f"❌ LLM 提取景点失败: {e}")
-        traceback.print_exc()
+        logger.exception("LLM 提取景点失败", extra={"err": str(e)})
         return []
 
 
@@ -115,15 +116,17 @@ async def geocode_attraction(geo_tool, name: str, region: Region,
     # 1) 组合名地理编码
     if geo_tool:
         try:
-            print(f"📍 [{idx}/{total}] 地理编码 {name}（搜索: {base}，范围: {region.label or '全国'}）...")
+            logger.debug("地理编码", extra={"poi": name, "query": base,
+                                         "region": region.label or "全国",
+                                         "idx": f"{idx}/{total}"})
             result = await geo_tool.ainvoke({"address": base, "city": city_value})
             coords = parse_coordinates(result)
             if coords:
-                print(f"  ✅ 坐标: {coords['lng']}, {coords['lat']}")
+                logger.debug("坐标命中", extra={"poi": name, **coords})
                 return coords
-            print(f"  ⚠️ 「{base}」未定位到具体地点")
+            logger.debug("未定位到具体地点", extra={"query": base})
         except Exception as e:
-            print(f"  ❌ 地理编码「{base}」异常: {e}")
+            logger.warning("地理编码异常", extra={"query": base, "err": str(e)})
 
     # 2) POI 关键词搜索兜底
     coords = await poi_search_rest(name, region)
@@ -133,17 +136,20 @@ async def geocode_attraction(geo_tool, name: str, region: Region,
     # 3) 裸名地理编码
     if geo_tool and base != name:
         try:
-            print(f"📍 [{idx}/{total}] 地理编码 {name}（裸名: {name}）...")
+            logger.debug("地理编码（裸名）", extra={"poi": name,
+                                                 "region": region.label or "全国"})
             result = await geo_tool.ainvoke({"address": name, "city": city_value})
             coords = parse_coordinates(result)
             if coords:
-                print(f"  ✅ 坐标: {coords['lng']}, {coords['lat']}")
+                logger.debug("坐标命中", extra={"poi": name, **coords})
                 return coords
-            print(f"  ⚠️ 「{name}」未定位到具体地点")
+            logger.debug("未定位到具体地点", extra={"query": name})
         except Exception as e:
-            print(f"  ❌ 地理编码「{name}」异常: {e}")
+            logger.warning("地理编码异常", extra={"query": name, "err": str(e)})
 
-    print(f"  ⚠️ {name} 三级查询均失败，将使用估算坐标")
+    # 三级都失败用 warning 而不是 debug：这意味着地图上这个点是估算位置，
+    # 用户看到的是"大概在这一带"，属于需要知道的降级，不该被日志级别过滤掉。
+    logger.warning("景点三级查询均失败，改用估算坐标", extra={"poi": name})
     return None
 
 
@@ -178,11 +184,12 @@ async def get_region_center(geo_tool, region: Region) -> Optional[Tuple[float, f
         })
         coords = parse_coordinates(result, allow_admin=True)
         if coords:
-            print(f"📌 目的地中心（{region.label}）: {coords['lng']}, {coords['lat']}")
+            logger.debug("目的地中心", extra={"region": region.label, **coords})
             return coords["lng"], coords["lat"]
-        print(f"⚠️ 未取到目的地中心（{region.label}），本轮跳过坐标合理性校验")
+        logger.warning("未取到目的地中心，本轮跳过坐标合理性校验",
+                       extra={"region": region.label})
     except Exception as e:
-        print(f"⚠️ 获取目的地中心失败: {e}")
+        logger.warning("获取目的地中心失败", extra={"err": str(e)})
     return None
 
 
@@ -205,21 +212,23 @@ async def resolve_center_base(located: List[Dict], geo_tool, region: Region,
     center = await get_region_center(geo_tool, region)
     if center:
         return center
-    print(f"⚠️ 拿不到目的地中心，回退到 .env 兜底坐标 {fallback}")
+    # 走到这里说明连目的地中心都拿不到，只能退回 .env 里的固定坐标。
+    # 这是明确的地理位置错误来源（三亚的景点会被画到大连），必须是 warning。
+    logger.warning("拿不到目的地中心，回退到 .env 兜底坐标", extra={"fallback": fallback})
     return fallback
 
 
 async def generate_map_data(state, plan_data: dict) -> Dict:
     """生成地图数据：景点坐标和路线"""
     try:
-        print("🗺️ 开始生成地图数据...map_data")
+        logger.info("开始生成地图数据")
         # 地图数据依赖 maps_geo / 驾车路线的工具对象，这里保证工具已加载
         await llm_runtime.ensure_tools()
         destination = state.get("destination", "")
 
         # 1. 提取所有景点
         attractions = await extract_attractions_with_llm(destination, plan_data)
-        print(f"📋 共 {len(attractions)} 个景点待获取坐标")
+        logger.debug("待定位景点数", extra={"count": len(attractions)})
 
         # 2. 获取景点坐标（使用高德 MCP）
         geo_tool = llm_runtime.tools_by_name.get("maps_geo")
@@ -232,8 +241,9 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
         # 只给了省份时（"帮我规划山东三天"），高德必须拿到省级 adcode 才会把结果
         # 限制在省内；以前 city 传空串，全国同名地点随便匹配，"大明湖"能落到新疆。
         region = parse_region(destination)
-        print(f"🧭 目的地解析: {destination!r} -> 城市={region.city!r} "
-              f"省份={region.province!r} 粒度={region.scope} 查询值={region.query_value!r}")
+        logger.info("目的地解析", extra={"destination": destination, "city": region.city,
+                                      "province": region.province, "scope": region.scope,
+                                      "query": region.query_value})
 
         # 目的地中心点，用于校验景点坐标是否跑偏
         center_ref = await get_region_center(geo_tool, region)
@@ -258,7 +268,7 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
                     geo_tool, attr["name"], attr_region, idx + 1, len(attractions)
                 )
             else:
-                print("  ⚠️ geo_tool 不存在，所有景点都将使用估算坐标")
+                logger.warning("geo_tool 不存在，所有景点都将使用估算坐标")
 
             # 坐标合理性校验：高德对同名地点是"谁相关取谁"，不校验就会把
             # 济南的芙蓉街变成云南那条、大明湖变成新疆那片。宁可判为未定位
@@ -268,8 +278,10 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
                     (coords["lng"], coords["lat"]), center_ref, region
                 )
                 if not ok:
-                    print(f"  ⚠️ {attr['name']} 坐标距目的地中心 {dist:.0f}km，"
-                          f"超过上限 {region.max_offset_km:.0f}km，判为错配，改用估算")
+                    logger.warning("景点坐标超出目的地范围，判为错配改用估算",
+                                   extra={"poi": attr["name"], "dist_km": round(dist),
+                                          "limit_km": round(region.max_offset_km),
+                                          "coord": f"{coords['lng']},{coords['lat']}"})
                     coords = None
 
             if coords:
@@ -283,15 +295,17 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
             center_base = await resolve_center_base(
                 located, geo_tool, region, (base_lng, base_lat), center_ref
             )
-            print(f"⚠️ {len(failed)} 个景点未精确定位，围绕 {center_base} 估算排布: "
-                  f"{[a['name'] for a in failed]}")
+            logger.warning("部分景点未精确定位，围绕中心估算排布",
+                           extra={"count": len(failed), "center": center_base,
+                                  "names": [a["name"] for a in failed]})
             for i, attr in enumerate(failed):
                 lng, lat = scatter_around(center_base, i, len(failed))
                 located.append({**attr, "lng": lng, "lat": lat, "approx": True})
 
         attractions_with_coords = located
-        print(f"🔍 坐标获取完成: {len(attractions_with_coords)} 个景点"
-              f"（精确定位 {len(located) - len(failed)} 个，估算 {len(failed)} 个）")
+        logger.info("坐标获取完成", extra={"total": len(attractions_with_coords),
+                                       "precise": len(located) - len(failed),
+                                       "approx": len(failed)})
 
         # 3. 规划路线（如果有多个景点）
         # 先按天分组再组内串联：原来是在全局序列上取相邻对、靠 day 是否相等来过滤，
@@ -321,7 +335,6 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
                 origin_day = day_no
 
                 try:
-                    print(f"🚗 规划路线: {origin['name']} → {dest['name']}")
                     route_info = await plan_driving_route(origin, dest)
                     routes.append({
                         "from": origin["name"],
@@ -335,11 +348,14 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
                         "duration": route_info.get("duration", 0),
                         "polyline": route_info.get("polyline", [])
                     })
-                    print(f"  ✅ 路线规划完成: {route_info.get('distance', 0)}m / "
-                          f"{route_info.get('duration', 0)}s / "
-                          f"折线 {len(route_info.get('polyline') or [])} 点")
+                    logger.debug("路线规划完成",
+                                 extra={"from": origin["name"], "to": dest["name"],
+                                        "distance_m": route_info.get("distance", 0),
+                                        "polyline_pts": len(route_info.get("polyline") or [])})
                 except Exception as e:
-                    print(f"路线规划失败: {e}")
+                    logger.warning("路线规划失败",
+                                   extra={"from": origin["name"], "to": dest["name"],
+                                          "err": str(e)})
                     routes.append({
                         "from": origin["name"],
                         "to": dest["name"],
@@ -367,7 +383,7 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
                         "lat": coord[1]
                     })
                     existing_names.add(point)
-                    print(f"➕ 补全景点: {point} ({coord})")
+                    logger.debug("补全路线端点", extra={"poi": point})
         # 地图中心取精确坐标的均值（估算点不参与，否则会把中心拉偏）
         precise = [a for a in attractions_with_coords if not a.get("approx")]
         center_source = precise or attractions_with_coords
@@ -385,10 +401,11 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
             "destination": destination,
             "center": center
         }
-        print(f"✅ 地图数据生成完成: {len(result['attractions'])} 个景点, {len(result['routes'])} 段路线")
+        logger.info("地图数据生成完成",
+                    extra={"attractions": len(result["attractions"]),
+                           "routes": len(result["routes"])})
         return result
 
     except Exception as e:
-        print(f"生成地图数据失败: {e}")
-        traceback.print_exc()
+        logger.exception("生成地图数据失败", extra={"err": str(e)})
         return {}

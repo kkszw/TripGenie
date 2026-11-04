@@ -12,6 +12,7 @@
 import base64
 import hashlib
 import secrets
+
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict
 
@@ -21,6 +22,9 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.config import settings
+from app.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 # auto_error=False：自己控制 401 的文案，不让 FastAPI 返回 "Not authenticated"
 _bearer = HTTPBearer(auto_error=False)
@@ -30,7 +34,7 @@ if not _JWT_SECRET:
     # 没配 JWT_SECRET 也能跑，但重启后所有令牌失效（密钥变了）。
     # 生产环境必须在 .env 里固定一个随机串。
     _JWT_SECRET = secrets.token_urlsafe(48)
-    print("⚠️ 未配置 JWT_SECRET，已使用临时密钥：重启后现有登录态全部失效")
+    logger.warning("未配置 JWT_SECRET，已使用临时密钥：重启后现有登录态全部失效")
 
 UNAUTHORIZED = HTTPException(
     status_code=status.HTTP_401_UNAUTHORIZED,

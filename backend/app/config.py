@@ -66,8 +66,16 @@ class Settings(BaseSettings):
     # CORS（.env 里没配也不会崩，给个本地开发默认值；配了则按 .env 的 JSON 数组解析）
     allowed_origins: List[str] = ["http://localhost:5173"]
 
-    # 日志
+    # ===== 日志与度量 =====
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
+    # 日志文件和 runs.jsonl 的目录，留空用 backend/logs
+    log_dir: str = os.getenv("LOG_DIR", "")
+    # 每次规划结束是否往 logs/runs.jsonl 追加一行摘要
+    run_log_enabled: bool = os.getenv("RUN_LOG_ENABLED", "true").lower() in ("1", "true", "yes")
+    # LLM 单价（元 / 百万 token），用于估算成本。
+    # 留 0 表示只统计 token 不折算金额 —— 单价会变，写死在代码里就是定时炸弹。
+    llm_input_price: float = float(os.getenv("DEEPSEEK_INPUT_PRICE", "0"))
+    llm_output_price: float = float(os.getenv("DEEPSEEK_OUTPUT_PRICE", "0"))
 
     class Config:
         env_file = ".env"

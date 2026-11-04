@@ -5,7 +5,10 @@ from typing import Dict
 
 import httpx
 
+from app.core.logging import get_logger
 from app.utils.path_tool import get_absolute_path
+
+logger = get_logger(__name__)
 
 _WEATHER_API = "http://t.weather.itboy.net/api/weather/city/"
 
@@ -70,5 +73,5 @@ async def get_weather(city_name: str):
             data = response.json().get("data")
             return data or "天气服务返回为空"
     except Exception as e:
-        print(f"天气服务请求失败: {e}")
+        logger.warning("天气服务请求失败", extra={"err": str(e)})
         return "天气服务请求失败"

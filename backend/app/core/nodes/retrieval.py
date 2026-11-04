@@ -9,8 +9,11 @@ import asyncio
 from langchain_core.runnables import RunnableConfig
 
 from app.core import llm as llm_runtime
+from app.core.logging import get_logger
 from app.core.state import TripState
 from app.rag.retriever import retrieve_context
+
+logger = get_logger(__name__)
 
 
 async def retrieve_guides(state: TripState, config: RunnableConfig = None):
@@ -38,7 +41,7 @@ async def retrieve_guides(state: TripState, config: RunnableConfig = None):
             })
         return {"similar_guides": ctx.get("context", "")}
     except Exception as e:
-        print(f"错误，retrieve_guides出现错误{e}")
+        logger.warning("攻略检索失败", extra={"err": str(e)})
         # 不能只 print 后隐式返回 None：LangGraph 会把 None 当"空更新"直接放过，
         # 用户拿到一份没有攻略依据的行程，却不知道检索失败了。写进专门的键让前端可见。
         # 用 guides_error 而不是共用的 error：三个并行节点同时写 error 会 InvalidUpdateError。
@@ -65,7 +68,7 @@ async def search_attractions_node(state: TripState, config: RunnableConfig = Non
             })
         return {"attractions_pool": ctx.get("context", "")}
     except Exception as e:
-        print(f"错误，search_attractions_node出现错误:{e}")
+        logger.warning("景点检索失败", extra={"err": str(e)})
         return {"attractions_error": f"景点检索失败: {e}"}
 
 
@@ -85,14 +88,14 @@ async def get_weather_node(state: TripState, config: RunnableConfig = None):
         # 原来直接 response.tool_calls[0]：模型没返回 tool_call 就 IndexError，
         # 被下面的 except 吞掉，天气永远是"未知"。
         if not response.tool_calls:
-            print("⚠️ 天气节点：模型没有返回工具调用，跳过天气查询")
+            logger.debug("天气节点：模型没有返回工具调用，跳过天气查询")
             return {"weather_info": None}
         tool_call = response.tool_calls[0]
         tool_name = tool_call['name']
         tool_args = tool_call['args']
         tool = llm_runtime.tools_by_name.get(tool_name)
         if not tool:
-            print(f"⚠️ 天气节点：工具 {tool_name} 不存在")
+            logger.warning("天气工具不可用", extra={"tool": tool_name})
             return {"weather_info": None, "weather_error": f"天气工具 {tool_name} 不可用"}
         weather_result = await tool.ainvoke(tool_args)
         if writer:
@@ -103,5 +106,5 @@ async def get_weather_node(state: TripState, config: RunnableConfig = None):
             })
         return {"weather_info": weather_result}
     except Exception as e:
-        print(f"错误，get_weather_node出现错误:{e}")
+        logger.warning("天气获取失败", extra={"err": str(e)})
         return {"weather_info": None, "weather_error": f"天气获取失败: {e}"}

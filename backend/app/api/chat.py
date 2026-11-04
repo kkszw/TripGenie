@@ -2,7 +2,7 @@ import asyncio
 import uuid
 import json
 from datetime import date
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.sse import EventSourceResponse
@@ -10,12 +10,15 @@ from langchain_core.messages import HumanMessage, AIMessage, RemoveMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command
 from app.core.langgraph_app import get_workflow
+from app.core.logging import bind_context, get_logger, new_trace_id
+from app.core.metrics import RunMetrics
 from app.core.security import get_current_user
 from app.core.state import TripState
 from app.models.chat import ChatRequest, ResumeRequest
 from app.services.database import db
 
 router = APIRouter()
+logger = get_logger(__name__)
 
 # 三个接口共用：Nginx 会缓冲响应，不关掉 SSE 就变成"最后一次性吐出来"
 _SSE_HEADERS = {
@@ -45,8 +48,16 @@ async def send_chat(request: ChatRequest, current_user: Dict = Depends(get_curre
     else:
         db.create_session(request.thread_id, current_user["id"], "新对话")
 
+    # trace_id 在这里生成并绑到上下文：本次请求里的所有日志（含节点内部、
+    # 高德调用、LLM 调用）都会自动带上它，排查时用 grep 一次捞全。
+    trace_id = new_trace_id()
+    bind_context(trace_id=trace_id, thread_id=request.thread_id,
+                 user_id=current_user["id"])
+    logger.info("收到消息", extra={"chars": len(request.message or "")})
+
     return EventSourceResponse(
-        generate_sse_input(request.thread_id, request.message or ""),
+        generate_sse_input(request.thread_id, request.message or "", trace_id,
+                           current_user["id"]),
         headers=_SSE_HEADERS,
     )
 
@@ -73,8 +84,14 @@ async def resume_chat(request: ResumeRequest, current_user: Dict = Depends(get_c
             detail="没有待确认的请求（可能已经确认过了）",
         )
 
+    trace_id = new_trace_id()
+    bind_context(trace_id=trace_id, thread_id=request.thread_id,
+                 user_id=current_user["id"])
+    logger.info("恢复中断", extra={"payload": request.payload or {}})
+
     return EventSourceResponse(
-        generate_sse_resume(request.thread_id, request.payload or {}),
+        generate_sse_resume(request.thread_id, request.payload or {}, trace_id,
+                            current_user["id"]),
         headers=_SSE_HEADERS,
     )
 
@@ -111,15 +128,65 @@ def _interrupt_value(snapshot) -> Optional[dict]:
     return None
 
 
+def _record_llm(metrics: RunMetrics, event: dict) -> None:
+    """从 on_chat_model_end 事件里取 token 用量。
+
+    一个容易踩的坑：流式调用下 usage_metadata 不在最后一个 chunk 上，而是单独
+    一个 content 为空的 chunk（拆开看就是这样，只看最后一块永远是 None）。
+    但 on_chat_model_end 的 output 是聚合后的 AIMessageChunk，这里能拿到完整用量——
+    实测 {'input_tokens': 8, 'output_tokens': 32, 'total_tokens': 40}。
+
+    兜底再试 response_metadata.token_usage：非流式调用（with_structured_output、
+    部分兼容端点）只在这一层给 prompt_tokens / completion_tokens。
+    """
+    output = event["data"].get("output")
+    node = (event.get("metadata") or {}).get("langgraph_node") or "-"
+
+    if isinstance(output, dict):
+        usage = output.get("usage_metadata") or {}
+        response_meta = output.get("response_metadata") or {}
+    else:
+        usage = getattr(output, "usage_metadata", None) or {}
+        response_meta = getattr(output, "response_metadata", None) or {}
+
+    if not usage:
+        token_usage = response_meta.get("token_usage") or {}
+        if token_usage:
+            usage = {
+                "input_tokens": token_usage.get("prompt_tokens", 0),
+                "output_tokens": token_usage.get("completion_tokens", 0),
+            }
+
+    metrics.add_llm(
+        node=node,
+        model=response_meta.get("model_name") or "-",
+        input_tokens=usage.get("input_tokens", 0) or 0,
+        output_tokens=usage.get("output_tokens", 0) or 0,
+        run_id=event.get("run_id"),
+    )
+
+
 async def _run_stream(thread_id: str,
                       *,
                       user_message: Optional[str] = None,
-                      resume_payload: Optional[dict] = None):
+                      resume_payload: Optional[dict] = None,
+                      trace_id: Optional[str] = None,
+                      user_id: Any = "-"):
     """把图的事件流翻译成 SSE 帧。
 
     首次请求（user_message）和确认恢复（resume_payload）走同一段逻辑，
     区别只在喂给图的是什么：初始 state，还是 Command(resume=...)。
+
+    顺带在这里做度量：SSE 这条流已经是"一次运行"的完整边界，节点耗时、
+    LLM token、工具调用次数都能从同一次事件遍历里取到，不用再给每个节点
+    埋点。结束时写一行到 logs/runs.jsonl。
     """
+    # 出口函数和生成器可能不在同一个 task 里，这里再绑一次，保证流式过程中
+    # 的日志也带 trace_id（contextvars 在 task 间是拷贝语义，绑两次只多一次赋值）
+    trace = trace_id or new_trace_id()
+    bind_context(trace_id=trace, thread_id=thread_id)
+    metrics = RunMetrics(trace, thread_id, user_id=user_id or "-")
+
     workflow = await get_workflow()
 
     # 图里真正的节点名。条件边的路由函数（intent_router / route_after_format /
@@ -135,25 +202,28 @@ async def _run_stream(thread_id: str,
     #   2. 保留旧的节点名白名单作兼容（还没打标记的老代码不会突然丢正文）。
     LEGACY_TEXT_NODES = ("generate_plan", "chat")
 
-    # 返回 thread_id
-    yield f"data: {json.dumps({'thread_id': thread_id})}\n\n"
+    # 首帧带上 trace_id：用户说"刚才失败了"时，把气泡上这个短码给你，
+    # 比翻几百行日志找"19:03 左右那次"靠谱得多。
+    yield f"data: {json.dumps({'thread_id': thread_id, 'trace_id': trace})}\n\n"
 
     # 这些变量在 try 外面初始化：断开时 except 分支要读它们打日志，
     # 如果异常发生在 try 的前几行（比如历史消息读库失败），放在里面就是 NameError。
     full_response = ""
     save_content = ""
     interrupt_payload: Optional[dict] = None
+    # 运行结果，finally 据此落盘。默认按失败算——中途抛异常没改到它，
+    # 记成 failed 比记成 ok 安全。
+    run_status = "failed"
 
     try:
         if resume_payload is not None:
             # 恢复：图从 checkpoint 里 pending 的那个节点继续
             graph_input = Command(resume=resume_payload)
-            print(f"▶️ 恢复中断: {thread_id} - {resume_payload}")
         else:
             # 获取历史消息
             history_messages = db.get_messages(thread_id)
             db.add_message(thread_id, "user", user_message or "")
-            print(f"💾 保存用户消息: {thread_id} - {(user_message or '')[:20]}...")
+            logger.debug("用户消息已入库", extra={"history": len(history_messages)})
 
             # messages 通道带 add_messages reducer，图输入是"追加"而不是"覆盖"。
             # 本项目的对话历史每轮都从 SQLite 重建，而 checkpoint 里也存着上一轮的
@@ -184,6 +254,16 @@ async def _run_stream(thread_id: str,
         async for event in workflow.astream_events(graph_input, config=config, version="v2"):
             kind = event["event"]
 
+            # ---- 度量采样：与下面的 SSE 翻译完全解耦 ----
+            # 单独一组 if 而不是并入 elif 链，是为了两件事互不影响：
+            # 度量出错不该让用户少收一个 token，推送逻辑也不该关心 token 统计。
+            if kind == "on_chat_model_start":
+                metrics.llm_start(event.get("run_id") or "")
+            elif kind == "on_chat_model_end":
+                _record_llm(metrics, event)
+            elif kind == "on_tool_end":
+                metrics.add_tool(event.get("name") or "")
+
             # ✅ 处理 LLM 流式输出
             if kind == "on_chat_model_stream":
                 chunk = event["data"]["chunk"]
@@ -206,12 +286,14 @@ async def _run_stream(thread_id: str,
             elif kind == "on_chain_start":
                 node_name = event.get("name", "unknown")
                 if node_name in node_names:
+                    metrics.node_start(node_name)
                     yield f"data: {json.dumps({'type': 'node_start', 'node': node_name, 'message': f'正在执行 {node_name}...'}, ensure_ascii=False)}\n\n"
 
             # ✅ 处理节点结束
             elif kind == "on_chain_end":
                 node_name = event.get("name", "unknown")
                 if node_name in node_names:
+                    metrics.node_end(node_name)
                     output = event["data"].get("output", {})
 
                     # 节点把失败写进 state 的错误键。之前三个并行检索节点的 except 只
@@ -252,10 +334,10 @@ async def _run_stream(thread_id: str,
                         if isinstance(output, dict):
                             draft_plan = output.get("draft_plan")
                             map_data = output.get("map_data")
-
-                            print(f"🔍 generate_map 完成: draft_plan={bool(draft_plan)}, map_data={bool(map_data)}")
-                            if map_data:
-                                print(f"🔍 map_data.attractions 数量: {len(map_data.get('attractions', []))}")
+                            logger.debug(
+                                "generate_map 完成",
+                                extra={"has_plan": bool(draft_plan), "has_map": bool(map_data),
+                                       "attractions": len((map_data or {}).get("attractions", []))})
 
                             if draft_plan:
                                 has_trip_plan = True
@@ -269,7 +351,14 @@ async def _run_stream(thread_id: str,
                                     "budget": output.get("budget", 0),
                                     "tips": output.get("plan_tips", [])
                                 }
-                                print(f"📤 发送 trip_plan: map_data={bool(plan.get('map_data'))}")
+                                # 摘要里带上目的地和天数：事后翻 runs.jsonl，
+                                # 一眼能看出这行是"青岛三天"还是"山东全省七天"
+                                metrics.note("destination", output.get("destination"))
+                                metrics.note("days", len(draft_plan))
+                                metrics.note("attractions",
+                                             len((map_data or {}).get("attractions", [])))
+                                logger.info("行程就绪", extra={"days": len(draft_plan),
+                                                             "has_map": bool(map_data)})
                                 yield f"data: {json.dumps({'type': 'trip_plan', 'plan': plan}, ensure_ascii=False)}\n\n"
 
                     yield f"data: {json.dumps({'type': 'node_end', 'node': node_name, 'message': f'{node_name} 完成'}, ensure_ascii=False)}\n\n"
@@ -288,12 +377,13 @@ async def _run_stream(thread_id: str,
             try:
                 interrupt_payload = _interrupt_value(await _get_snapshot(thread_id))
             except Exception as e:
-                print(f"⚠️ 读取中断状态失败: {e}")
+                logger.warning("读取中断状态失败", extra={"err": str(e)})
 
         if interrupt_payload is not None:
             # 中断这一轮没有正文：不落库、不发 done。
             # 前端渲染确认卡，点按钮后走 /resume 从 checkpoint 原地恢复。
-            print(f"⏸️ 等待用户确认: {thread_id} -> {interrupt_payload}")
+            run_status = "interrupted"
+            logger.info("等待用户确认", extra={"interrupt": interrupt_payload})
             yield f"data: {json.dumps({'type': 'interrupt', 'payload': interrupt_payload}, ensure_ascii=False)}\n\n"
             return
 
@@ -302,7 +392,7 @@ async def _run_stream(thread_id: str,
 
         if content_to_save:
             db.add_message(thread_id, "assistant", content_to_save, map_data=map_data_to_save)
-            print(f"💾 保存 AI 回复（{len(content_to_save)} 字符）: {content_to_save[:80]}...")
+            logger.info("回复已落库", extra={"chars": len(content_to_save)})
 
         # 更新会话名称（只有首次请求带 user_message，resume 时不需要）
         if user_message is not None:
@@ -310,8 +400,9 @@ async def _run_stream(thread_id: str,
             if session and session.get("name") == "新对话":
                 title = user_message[:10] + ("..." if len(user_message) > 20 else "")
                 db.update_session_name(thread_id, title)
-                print(f"📝 更新会话名称: {thread_id} - {title}")
+                logger.debug("会话已命名", extra={"title": title})
 
+        run_status = "ok"
         yield f"data: {json.dumps({'type': 'done', 'done': True})}\n\n"
 
     except asyncio.CancelledError:
@@ -321,23 +412,31 @@ async def _run_stream(thread_id: str,
         # 这里刻意不落库：此刻 save_content 大概率是半截行程 JSON，
         # 存下来之后刷新页面就是一屏解析不了的原始文本，比没有更糟。
         # 用户消息在开头已经存了，历史里不会丢——重发一次即可。
-        print(f"⏹️ 客户端断开，已停止生成: {thread_id}"
-              f"（已推送 {len(full_response)} 字符，未落库）")
+        run_status = "cancelled"
+        logger.info("客户端断开，停止生成",
+                    extra={"pushed_chars": len(full_response), "saved": False})
         raise
     except Exception as e:
-        print(f"❌ 错误: {e}")
-        import traceback
-        traceback.print_exc()
+        # logger.exception 自带 traceback，不需要再 traceback.print_exc()
+        logger.exception("规划流程异常", extra={"err": str(e)})
         yield f"data: {json.dumps({'type': 'error', 'error': str(e)}, ensure_ascii=False)}\n\n"
+    finally:
+        # 三条出口（正常 / 中断 / 异常）都从这里收尾：打一行汇总 + 写 runs.jsonl。
+        # 放在 finally 是因为中断和取消都是 return / raise 出去的，漏一处就没有数据。
+        metrics.close(run_status)
 
 
-async def generate_sse_input(thread_id: str, message: str):
+async def generate_sse_input(thread_id: str, message: str,
+                             trace_id: Optional[str] = None, user_id: Any = "-"):
     """首次请求：写用户消息 + 从 SQLite 重建历史，然后跑图。"""
-    async for frame in _run_stream(thread_id, user_message=message):
+    async for frame in _run_stream(thread_id, user_message=message,
+                                   trace_id=trace_id, user_id=user_id):
         yield frame
 
 
-async def generate_sse_resume(thread_id: str, payload: dict):
+async def generate_sse_resume(thread_id: str, payload: dict,
+                              trace_id: Optional[str] = None, user_id: Any = "-"):
     """确认恢复：不重建历史、不动 messages，直接 Command(resume=...)。"""
-    async for frame in _run_stream(thread_id, resume_payload=payload):
+    async for frame in _run_stream(thread_id, resume_payload=payload,
+                                   trace_id=trace_id, user_id=user_id):
         yield frame

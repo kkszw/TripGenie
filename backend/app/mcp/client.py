@@ -6,8 +6,11 @@ from pathlib import Path
 from typing import Any, List
 from langchain_core.tools import BaseTool
 from app.config import settings
+from app.core.logging import get_logger
 from app.core.tools import get_weather_tool, retrieve_guides_tool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+
+logger = get_logger(__name__)
 
 DISABLED_MCP_TOOLS = [
     "maps_weather",
@@ -87,7 +90,7 @@ async def getAllClientTools():
         mcp_tools += time_mcp_tools
         mcp_tools += amap_mcp_tools
     except Exception as e:
-        print(f"加载MCP工具失败: {e}")
+        logger.warning("加载 MCP 工具失败", extra={"err": str(e)})
 
     return mcp_tools
 
