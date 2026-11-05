@@ -27,14 +27,24 @@ async def retrieve_guides(state: TripState, config: RunnableConfig = None):
         })
     try:
         # days 现在允许为 None（表示用户没说，会先被 clarify 拦住），这里兜一次底
-        query = f"去{state['destination']}玩{state.get('days') or 3}天，预算{state.get('budget')},喜欢{' '.join(state.get('preferences'))}"
+        prefs = " ".join(state.get("preferences") or [])
+        query = f"去{state['destination']}玩{state.get('days') or 3}天"
+        # 预算和偏好都可能没有。原来无条件拼进去，会得到「预算None,喜欢」
+        # 这种半截句子，末尾挂一个没有宾语的动词，对 embedding 是噪声。
+        if state.get("budget"):
+            query += f"，预算{state['budget']}"
+        if prefs:
+            query += f"，喜欢{prefs}"
         # retrieve_context 内部是同步的 embedding HTTP 调用，直接跑会阻塞事件循环
         # （SSE 心跳、其它请求一起卡住），丢到线程池里执行。
         # 只取已格式化的 context 文本：原来把 List[Document] 直接塞进 prompt，
         # 发给模型的是 `[Document(page_content='...', metadata={...})]` 的 Python repr。
         # user_id 让检索额外覆盖用户自己上传的资料（没有则只查内置攻略库）。
+        # destination 让检索先在本目的地的语料里找：125 份攻略是同一套模板，
+        # 「交通」「有问必答」这些章节措辞逐字相同，不过滤就会拿回外地的段落。
         ctx = await asyncio.to_thread(
-            retrieve_context, query, top_k=5, user_id=state.get("user_id"))
+            retrieve_context, query, top_k=5, user_id=state.get("user_id"),
+            destination=state.get("destination"))
         if writer:
             writer({
                 "type": "node_end",
@@ -60,9 +70,13 @@ async def search_attractions_node(state: TripState, config: RunnableConfig = Non
             "message": "正在搜索相关旅游景点..."
         })
     try:
-        query = f"{state['destination']}的景点推荐,喜好：{' '.join(state.get('preferences'))}"
+        prefs = " ".join(state.get("preferences") or [])
+        query = f"{state['destination']}的景点推荐"
+        if prefs:
+            query += f"，喜好：{prefs}"
         ctx = await asyncio.to_thread(
-            retrieve_context, query, top_k=5, user_id=state.get("user_id"))
+            retrieve_context, query, top_k=5, user_id=state.get("user_id"),
+            destination=state.get("destination"))
         if writer:
             writer({
                 "type": "node_end",

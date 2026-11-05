@@ -33,12 +33,24 @@ _store_lock = threading.RLock()
 # 正确做法是一个 client 管多个 collection。
 _client = None
 
+# 库的代际。reset_collection 时 +1，用来让上层（retriever 的目的地列表）
+# 知道自己缓存的东西已经过期了。
+# 为什么需要：检索侧把「库里有哪些目的地」缓存在进程内存里，重建语料后
+# 不重启服务，过滤条件还是旧的，表现为「新加的城市检索不到」——不报错，
+# 只是查不出来，是最难排查的那种。
+_generation = 0
+
+
+def get_generation() -> int:
+    """当前库的代际。缓存方拿它判断是否需要重算。"""
+    return _generation
+
 # 两个独立的 collection：
-#   public —— 内置的城市攻略（data/travel_guide）
+#   public —— 内置的城市攻略（app/data/corpus + build_corpus.py）
 #   user   —— 用户自己上传的 PDF 资料
 #
 # 为什么不做成「同一个 collection + 元数据过滤」，理由有两个，都不是洁癖：
-#   1. 现有的 119 个公共块没有 user_id 字段。Chroma 的过滤语法里
+#   1. 公共块没有 user_id 字段。Chroma 的过滤语法里
 #      {"user_id": {"$ne": "x"}} 只匹配「有这个字段且不等于」的文档，
 #      无字段的公共块会被整体滤掉 —— 一加过滤，公共攻略全部消失，且不报错。
 #   2. 用户资料要支持「删一份文档就删干净」，独立 collection 里按
@@ -115,6 +127,48 @@ def delete_documents(where: Dict, scope: str = "user") -> None:
     store = get_vector_store(scope=scope)
     store._collection.delete(where=where)
     logger.info("向量库删除完成", extra={"where": where, "scope": scope})
+
+
+def count_documents(where: Dict, scope: str = "public") -> int:
+    """数一下符合 where 的块有多少。用于「这份资料已经入库了吗」。
+
+    include=[] 只要 id，不拉回 embedding —— 建库脚本每份语料都问一次，
+    带上向量会让这一步从毫秒级变成秒级。
+    """
+    store = get_vector_store(scope=scope)
+    result = store._collection.get(where=where, include=[])
+    return len(result.get("ids") or [])
+
+
+def reset_collection(scope: str = "public") -> None:
+    """清空一个 collection 并重建，不动另一个库。
+
+    为什么不照搬 init_rag_database 的 `shutil.rmtree(chroma_db_path)`：
+    那个路径下同时放着 public 和 user 两个 collection，整个目录删掉会把
+    用户上传的资料一起抹掉。重建公共语料不该有这种副作用。
+
+    删除之后必须把缓存里的 store 扔掉，否则 get_vector_store 拿到的还是
+    指向已删除 collection 的旧对象，下一次写入会报
+    "Collection ... does not exist"。
+    """
+    global _generation
+
+    client = _get_client()
+    name = _collection_name(scope)
+    try:
+        client.delete_collection(name)
+    except Exception as exc:  # 集合本来就不存在时 Chroma 抛的异常类型不稳定
+        logger.info("删除 collection 未执行", extra={"collection": name, "err": str(exc)})
+
+    with _store_lock:
+        _stores.pop(scope, None)
+
+    # 让依赖库内容的上层缓存失效
+    _generation += 1
+
+    # 立刻建回来，让后续 add_documents 有地方写
+    get_vector_store(scope=scope)
+    logger.info("collection 已重建", extra={"collection": name, "scope": scope})
 
 
 def get_retriever(top_k: int = 5, scope: str = "public"):

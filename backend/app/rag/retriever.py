@@ -10,6 +10,11 @@
     前 5 条全是它，其它来源就进不来了，答案会变成"这本书的摘要"。
   - 完全相同的正文只保留一条。两个 collection 不会有重复，但公共库
     本身是多份攻略拼起来的，转载内容重复很常见。
+
+内置语料从 1 份变成 125 份之后多了一层约束：**按目的地过滤**。
+这批攻略是同一家出的同一套模板，「交通·TRANSPORTATION」「有问必答·FAQ」
+「亮点·HIGH LIGHTS」这些章节标题逐字相同，向量空间里挤成一团。
+不过滤的话，问大连会拿回三亚的交通段落——内容看着很专业，其实是错的。
 """
 from typing import Any, Dict, List, Optional
 from math import ceil
@@ -17,13 +22,69 @@ from math import ceil
 from langchain_core.documents import Document
 
 from app.core.logging import get_logger
-from app.rag.vector_store import get_vector_store
+from app.rag.vector_store import get_generation, get_vector_store
 
 logger = get_logger(__name__)
 
 # 单份资料最多贡献几块。取 2 是因为 top_k 通常是 5：
 # 给用户资料留 2 个名额，公共库还有 3 个，两边都能说话。
 MAX_PER_DOC = 2
+
+# 公共库里出现过的目的地。第一次检索时聚合一次，之后进程内复用 ——
+# 几千条 metadata 全取一遍要几十毫秒，每次查询都做没必要。
+# 缓存的失效靠 vector_store 的代际号（重建库时会 +1）。
+_destinations: Optional[List[str]] = None
+_destinations_gen = -1
+
+
+
+def known_destinations() -> List[str]:
+    """公共语料里出现过的目的地，进程内缓存。
+
+    从向量库的元数据聚合，而不是去读 corpus 目录：向量库才是检索时真正
+    有的东西，两者可能短暂不同步（刚 extract 还没 index），以库为准更诚实。
+
+    缓存跟着库的代际走：重建语料后（reset_collection）代数 +1，这里自动
+    重算。否则新加的城市在进程重启前永远匹配不上，表现是「检索不到」，
+    不报错，很难查。
+    """
+    global _destinations, _destinations_gen
+    generation = get_generation()
+    if _destinations is None or _destinations_gen != generation:
+        try:
+            store = get_vector_store(scope="public")
+            data = store._collection.get(include=["metadatas"])
+            values = {
+                str(meta.get("destination"))
+                for meta in (data.get("metadatas") or [])
+                if meta and meta.get("destination")
+            }
+            _destinations = sorted(values)
+        except Exception as exc:  # 库还没建 / 读失败都不该让检索挂掉
+            logger.debug("目的地列表读取失败", extra={"err": str(exc)})
+            _destinations = []
+        _destinations_gen = generation
+    return _destinations
+
+
+def match_destinations(name: Optional[str]) -> List[str]:
+    """把用户说的地名映射到库里实际有的目的地。
+
+    三种命中都要算：
+      - 完全相等：「大连」→「大连」
+      - 库里更具体：「香港」→「香港购物」「香港离岛」
+      - 用户说得更具体：「香港离岛」→ 也带上「香港」，因为香港攻略里
+        往往有一整节讲离岛，扔掉它就等于自断一条线索
+
+    反过来不做（「云南」不会带出「昆明」）——那需要一张省市归属表，
+    等真的出现召回不足再说，宁可现在少做也不要编一张错表。
+    """
+    if not name:
+        return []
+    name = name.strip()
+    if not name:
+        return []
+    return [d for d in known_destinations() if d == name or name in d or d in name]
 
 
 def _source_label(doc: Document) -> str:
@@ -141,7 +202,8 @@ def _merge(candidates: List[tuple], top_k: int, max_per_doc: int) -> List[Docume
 
 
 def retrieve_context(query: str, top_k: int = 5,
-                     user_id: Optional[str] = None) -> Dict[str, Any]:
+                     user_id: Optional[str] = None,
+                     destination: Optional[str] = None) -> Dict[str, Any]:
     """检索上下文。
 
     Args:
@@ -149,6 +211,8 @@ def retrieve_context(query: str, top_k: int = 5,
         top_k: 最终返回的块数
         user_id: 当前登录用户。给了就会额外检索他的私有资料；
                  不给则只查公共攻略库（脚本、评测走这条路径）。
+        destination: 本次要去的地方。给了就先只在该目的地的语料里检索，
+                     命中不足 top_k 再放开到全库。
 
     Returns:
         {"docs": List[Document], "context": str, "sources": List[str]}
@@ -157,7 +221,21 @@ def retrieve_context(query: str, top_k: int = 5,
     # 合并时一旦触发去重/限额，最终数量会少于 top_k。
     fetch_k = max(top_k * 2, 10)
 
-    candidates = _search(query, fetch_k, "public")
+    matched = match_destinations(destination)
+    candidates: List[tuple] = []
+
+    if matched:
+        try:
+            candidates += _search(query, fetch_k, "public",
+                                  where={"destination": {"$in": matched}})
+        except Exception as exc:
+            # 过滤语法/字段缺失等问题不该让规划直接失败，退回全库检索
+            logger.warning("目的地过滤检索失败，退回全库",
+                           extra={"destination": destination, "err": str(exc)})
+            matched = []
+
+    if not matched:
+        candidates += _search(query, fetch_k, "public")
 
     if user_id:
         try:
@@ -168,6 +246,17 @@ def retrieve_context(query: str, top_k: int = 5,
             logger.debug("用户资料检索跳过", extra={"user_id": user_id, "err": str(exc)})
 
     docs = _merge(candidates, top_k, MAX_PER_DOC)
+
+    # 该目的地的语料不够填满上下文时，放开到全库补齐。两种情况都会走到：
+    #   1. 库里根本没有这个地方（125 份覆盖了主要旅游地，但不可能全覆盖）
+    #   2. 用户问的是「从成都怎么去九寨沟」，需要出发地的交通章节
+    # 补齐用的是同一个 top_k 之外的剩余名额，不会把已经选中的本地块挤掉。
+    if matched and len(docs) < top_k:
+        seen = {doc.page_content.strip()[:200] for doc in docs}
+        extra = [(doc, score) for doc, score in _search(query, fetch_k, "public")
+                 if doc.page_content.strip()[:200] not in seen]
+        docs += _merge(extra, top_k - len(docs), MAX_PER_DOC)
+
     sources = list({_source_label(doc) for doc in docs})
 
     return {

@@ -90,6 +90,27 @@ class DayLabelTest(unittest.TestCase):
         line = "3月23日至11月15日，11月16日至3月23日 4:00-6:00 开放时间，门票 50 元"
         self.assertIsNone(detect_day_label(line))
 
+    def test_d_number_with_space_is_heading(self):
+        # 这批「我是驴友」攻略统一用「D1 亚龙湾-蝴蝶谷」标记行程，
+        # 数字后面跟的是空格而不是标点。最初只认标点，125 份里全漏了。
+        result = detect_day_label("D1 亚龙湾-蝴蝶谷-热带天堂森林公园")
+        self.assertIsNotNone(result)
+        self.assertEqual(result["day"], 1)
+        self.assertEqual(detect_day_label("D2 拉市海-束河古镇")["day"], 2)
+
+    def test_d_number_heading_ignores_length_limit(self):
+        # 行程标题和当天简介写在同一行，超过普通标题的 60 字上限也要认
+        line = "D3 " + "东陵公园-棋盘山-世博园-怪坡" + "，走了城中的主要景点，第三天就该往城外走了，路程比较远建议包车" * 2
+        self.assertGreater(len(line), 60)
+        result = detect_day_label(line)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["day"], 3)
+
+    def test_d_number_needs_separator(self):
+        # 「DOS 系统」这类不能当成 Day 标记
+        self.assertIsNone(detect_day_label("DOS 系统安装说明"))
+        self.assertIsNone(detect_day_label("地铁 1 号线直达"))
+
     def test_not_a_heading(self):
         self.assertIsNone(detect_day_label("我们第一天去了星海广场，第二天去了旅顺口，第三天在金石滩。"))
         self.assertIsNone(detect_day_label("一、行程概览"))

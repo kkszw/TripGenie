@@ -88,6 +88,14 @@ def cn_to_int(text: str) -> Optional[int]:
     return None
 
 
+# 行程标题行：「D1 亚龙湾-蝴蝶谷」「D2 拉市海-束河古镇」。
+# 这批「我是驴友」攻略统一用这个格式（实测 12/14 份都有），而且标题和当天
+# 简介写在同一行，长度经常超过普通标题的 60 字上限 —— 所以单独处理，
+# 不受下面那个长度限制。
+_DAY_LINE_RE = re.compile(
+    r"^[【\[（(]?\s*[Dd]\s*[-－]?\s*(\d{1,2})(?:\s|$|[】\]）)、.．:：])")
+
+
 def detect_day_label(line: str) -> Optional[Dict]:
     """判断某一行是不是「一天」的起始标记。
 
@@ -95,24 +103,34 @@ def detect_day_label(line: str) -> Optional[Dict]:
         {"day": int|None, "label": str}；不是天标记则 None。
         `day` 为 None 表示只认出日期形式的边界（10月3日），推不出第几天。
     """
-    if not line or len(line) > 60:  # 天标记总是在行首且短，长句不可能是标题
+    if not line:
+        return None
+    stripped = line.strip()
+
+    # 「D1 亚龙湾-蝴蝶谷…」先判，且不看行长度：它后面常直接接当天简介
+    match = _DAY_LINE_RE.match(stripped)
+    if match:
+        number = cn_to_int(match.group(1))
+        if number is not None and 1 <= number <= 60:
+            return {"day": number, "label": stripped[:20]}
+
+    if len(stripped) > 60:  # 天标记总是在行首且短，长句不可能是标题
         return None
     for kind, pattern in _DAY_PATTERNS:
-        match = pattern.match(line)
+        match = pattern.match(stripped)
         if not match:
             continue
         if kind == "date":
             # 日期型标记只认短行。「3月23日至11月15日，11月16日至3月23日4:00-6:00
             # 开放时间」这种行是以日期开头的正文，不是分段标题，一刀切会把
             # 一个完整的段落劈成两半（实测那份沈阳攻略的北陵公园一节就是这样）。
-            stripped = line.strip()
             if len(stripped) > 24:
                 return None
             return {"day": None, "label": stripped[:20]}
         number = cn_to_int(match.group(1))
         if number is None or not (1 <= number <= 60):
             return None
-        return {"day": number, "label": line.strip()[:20]}
+        return {"day": number, "label": stripped[:20]}
     return None
 
 

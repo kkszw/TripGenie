@@ -18,20 +18,25 @@ class Settings(BaseSettings):
     # 单次 LLM 调用的超时（秒），防止无响应时 SSE 一直挂着
     llm_timeout: int = int(os.getenv("LLM_TIMEOUT", "120"))
 
-    # ===== 向量化：百炼 qwen3.7-text-embedding-flash（OpenAI 兼容模式）=====
+    # ===== 向量化：百炼 text-embedding-v4（OpenAI 兼容模式）=====
     # 未单独配 EMBEDDING_API_KEY 时复用 DASHSCOPE_API_KEY
+    # 原用 qwen3.7-text-embedding-flash：免费额度（FreeTierOnly）用尽后持续 400，
+    # 全量建库拿不到向量，故换成同为 1024 维的 text-embedding-v4（按量计费）。
     embedding_api_key: str = os.getenv("EMBEDDING_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
     embedding_base_url: str = os.getenv(
         "EMBEDDING_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
     )
-    embedding_model: str = os.getenv("EMBEDDING_MODEL", "qwen3.7-text-embedding-flash")
+    embedding_model: str = os.getenv("EMBEDDING_MODEL", "text-embedding-v4")
     # 该模型支持 256/512/768/1024，默认 1024；改了必须重建向量库
     embedding_dimensions: int = int(os.getenv("EMBEDDING_DIMENSIONS", "1024"))
-    # 官方限制单次请求最多 20 条文本
-    embedding_batch_size: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "20"))
+    # 单次请求的文本条数上限。text-embedding-v4 / v3 都是 10 条，
+    # 老模型 qwen3.7-text-embedding-flash 是 20 条。取 10 对两者都成立——
+    # 超限时服务端直接 400（"batch size is invalid, it should not be larger than 10"），
+    # 不会自动降级，所以这里必须是保守值。
+    embedding_batch_size: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "10"))
     embedding_timeout: int = int(os.getenv("EMBEDDING_TIMEOUT", "30"))
     # collection 名带上模型标识：换模型时新老向量不能混在同一个 collection
-    embedding_collection: str = os.getenv("EMBEDDING_COLLECTION", "trip_guides_qwen37_flash")
+    embedding_collection: str = os.getenv("EMBEDDING_COLLECTION", "trip_guides_v4")
 
     DASHSCOPE_API_KEY: str = os.getenv("DASHSCOPE_API_KEY", "")
 

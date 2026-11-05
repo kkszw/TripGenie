@@ -145,6 +145,62 @@ OCR 还有个坑：RapidOCR 按全局 y 返回检测框，**双栏排版会逐�
 
 一个踩了很久的坑记在这里：**同一路径上不要建两个 chromadb 客户端**，后建的那个会让先建的 HNSW 段失效，报 `Error creating hnsw segment reader: Nothing found on disk`，而且只在"回头再查另一个 collection"时才炸。现在整个进程共用一个客户端、按 collection 区分。
 
+### 10. 内置语料库：125 份攻略切成 4074 块，按目的地过滤
+
+内置语料是 125 份「我是驴友」PDF，覆盖 123 个旅游目的地、2042 页、约 279 万字，切成 4074 块。
+
+**构建分两段，因为 OCR 是唯一昂贵的一步。**
+
+```bash
+python scripts/build_corpus.py extract --src "E:/旅行攻略"   # PDF → JSON，约 55 分钟
+python scripts/build_corpus.py index --rebuild                # JSON → 向量库，约 18 分钟
+python scripts/build_corpus.py index --skip-existing          # 中断后接着跑
+```
+
+第二段慢在 embedding 接口而不是本地算力：4074 块要发 400 多次请求（单批上限 10 条），实测约 4 块/秒。所以 `index` 也做了断点续传——**块数完全一致才跳过**，只判「有没有块」不够，因为上一轮可能写到一半被额度掐断，库里躺着半份，跳过它这份语料就永远缺后半本且不报错。
+
+抽取产物（`app/data/corpus/*.json`，含每页文本、页码、目的地、抽取模式）**提交在仓库里**。所以正常安装只需要跑第二段；调分块参数、换 embedding 模型、重建整个库，都不用再付那 55 分钟。代价是仓库多约 8 MB 纯文本，换掉 1.9 GB 原始 PDF 的依赖。
+
+**换 embedding 模型有三个硬约束，都是实际撞出来的。** 一是维度必须和 collection 一致，所以换模型要连 `EMBEDDING_COLLECTION` 一起改——不改的话同维度模型会被静默混进同一个集合，Chroma 不报错，只是相似度算得不对；二是单批条数随模型变（老 `qwen3.7-text-embedding-flash` 是 20，`text-embedding-v4` 只有 10），超了服务端直接 400 且不自动降级；三是**钱的问题有三种，报错各不相同**：免费额度用尽报 `AllocationQuota.FreeTierOnly`（换个模型就能继续）；账户欠费报 `Arrearage`，按账户整体拒付，连 rerank 的免费额度也一起 403（`Model.AccessDenied`）；预算管理里设的额度用尽报 `BudgetLimitExceeded`——这个最阴，余额还是正的，但所有调用都被拒。本项目默认 `text-embedding-v4`，全量 4074 块约 190 万 token，按量计费不到 1 元。
+
+**这批 PDF 有两种坏法，第一种已经被第 9 节的判据抓住，第二种是新发现的。**
+
+| 坏法 | 占比 | 表现 | 处理 |
+|---|---|---|---|
+| 生僻字乱码 | 63%（79 份） | 「的」全变成「癿」，字符系统性错位 | 判据命中 → 转 OCR |
+| 模板残留标题 | 15%（19 份，共删 80 行） | 正文是对的，但页眉混进别的城市封面标题 | 入库时清洗 |
+
+第二种更隐蔽：文字层看起来完全正常，生僻率 0%、句读通顺，但页脚躺着一行「桂林·攻略」，页眉躺着一行「川藏川藏南南线线十上十日海日攻略··攻攻略略」。这是制作模板把别的文档标题渲染了两遍再叠在一起。清洗规则最后只留了一条——**「别的目的地·攻略」标题行**，因为试过的其它判据（不同字重复次数、连续叠字、行首整词重复）全部被「空空荡荡」「咿咿呀呀」「喝喝茶，散散心」「一步一步地向石林深处走」这些正常句子打回。那几行交织的乱码留在正文里（每份 2~4 行，夹在段落中间不影响语义），换取的是**绝不误删正常文本**。
+
+**切块边界是「天」。** 这批攻略用 `D1 亚龙湾-蝴蝶谷-热带天堂森林公园` 的格式标记行程（125 份里 121 份命中，97%），而且标题和当天简介写在同一行。原来的天数识别要求 `D` 后面跟标点，空格版本全部漏掉，于是整份文档退化成按页切、`days=0`。放宽后三亚从 54 块降到 44 块，每块带上 `day_label`，问「第三天怎么安排」能直接命中那一天的行程。
+
+**每个块带 `destination`，检索时先在本目的地里找。** 这不是锦上添花：125 份攻略是同一家出的同一套模板，「交通·TRANSPORTATION」「有问必答·FAQ」「亮点·HIGH LIGHTS」这些章节标题逐字相同，正文句式也高度雷同。不按目的地过滤，问大连会拿回三亚的交通段落——内容读起来很专业，但完全是错的。
+
+过滤逻辑故意留了三条退路：
+
+- 目的地是结构化字段（`state["destination"]`），**从 user 输入里猜**，不是从 query 里做实体识别
+- 「香港」能匹配到「香港购物」「香港离岛」（库里更具体）；「香港离岛」也会带上「香港」（用户更具体）
+- 本地块不够填满 `top_k` 时放开到全库补齐——用户问「从成都怎么去九寨沟」时需要出发地的交通章节
+
+`scripts/eval_retrieval.py` 就是量化这件事的脚本，对每个目的地提问、统计 top-5 里本地块占比：
+
+```
+目的地 123 个，top_k=5
+
+关闭目的地过滤（全库检索）
+  本地块占比 local@5     55.4%
+  每问平均本地块               2.77
+开启目的地过滤
+  本地块占比 local@5    100.0%
+  每问平均本地块               5.00
+
+差值：+44.6 个百分点
+```
+
+语料只有十几份时这个差距是 86.2% → 100%（+13.7pt）；灌满 125 份之后掉到 55.4%——因为模板雷同的文档越多，向量空间里挤得越紧，不按目的地过滤时有一半上下文来自别的城市，而 LLM 会照着这些段落编行程。
+
+**断点续传与并行。** `extract` 按内容 sha256 判断是否已抽过，中断后重跑接着来，不会重新 OCR。分片参数 `--shard i/n` 是为多机准备的——**单机多开没有收益**，实测两个进程并行时单份 OCR 从 58 秒涨到 129 秒，吞吐基本不变，因为 onnxruntime 默认已经占满所有核心。
+
 ---
 
 ## 系统架构
@@ -182,7 +238,7 @@ flowchart TD
 | Agent 编排 | LangGraph（StateGraph / 条件边 / 并行扇出 / Checkpointer） |
 | 工具协议 | MCP（`langchain-mcp-adapters`，stdio transport） |
 | 大模型 | DeepSeek（`deepseek-flash`，通过 OpenAI 兼容端点接入）；`with_structured_output` 做意图分类 |
-| RAG | Chroma 向量库、`qwen3.7-text-embedding-flash`（百炼 OpenAI 兼容模式，1024 维）、Markdown 按标题层级分块 |
+| RAG | Chroma 向量库、`text-embedding-v4`（百炼 OpenAI 兼容模式，1024 维）、125 份内置攻略（文字层 + OCR 回退 → 按「天/页」分块，带目的地元数据） |
 | 后端 | Python 3.12+、FastAPI、SSE、asyncio |
 | 存储 | SQLite（业务库 + LangGraph 检查点） |
 | 前端 | Vue 3（Composition API）、Vite、原生 ReadableStream 解析 SSE、高德地图 JS API |
@@ -196,6 +252,7 @@ TripGenie/
 ├── .env.example
 ├── backend/
 │   ├── run.py                       # 启动入口（uvicorn）
+│   ├── scripts/                     # 运维脚本：语料构建 / 检索自检 / 排程基线
 │   └── app/
 │       ├── main.py                  # FastAPI 应用、CORS、路由注册
 │       ├── config.py                # 配置（统一读 .env）
@@ -219,9 +276,9 @@ TripGenie/
 │       ├── mcp/
 │       │   └── client.py             # MCP Server 接入与工具合并
 │       ├── rag/                     # 文档加载 / 分块 / 向量库 / 检索
-│       ├── services/                 # 会话库、天气、高德接口、地图数据、折线抽稀
+│       ├── services/                 # 会话库、天气、高德接口、地图数据、折线抽稀、PDF 抽取与语料清洗
 │       ├── models/                   # 请求 / 响应模型
-│       └── data/                     # 攻略文档、向量库、城市编码表、会话数据库
+│       └── data/                     # 语料（corpus JSON / Markdown）、向量库、城市编码表、会话数据库
 └── frontend/
     ├── index.html
     ├── vite.config.js               # 含 /api 反向代理
@@ -275,10 +332,10 @@ cp .env.example .env          # Windows: copy .env.example .env
 | `DEEPSEEK_MODEL` | `deepseek-flash`（默认）或 `deepseek-v4-pro` |
 | `DEEPSEEK_THINKING` | `disabled`（默认）/ `enabled`，见下方说明 |
 | `DASHSCOPE_API_KEY` | 百炼 API Key，**仅 RAG 向量化使用**（也可用 `EMBEDDING_API_KEY` 单独指定） |
-| `EMBEDDING_MODEL` | 向量模型，默认 `qwen3.7-text-embedding-flash` |
+| `EMBEDDING_MODEL` | 向量模型，默认 `text-embedding-v4`（1024 维，按量计费）。同族的 `text-embedding-v3` 也能用 |
 | `EMBEDDING_DIMENSIONS` | 向量维度，可选 `256/512/768/1024`，默认 1024。改了必须重建向量库 |
 | `EMBEDDING_COLLECTION` | Chroma collection 名，带模型标识；换模型时同步改，避免新老向量混库 |
-| `EMBEDDING_BATCH_SIZE` | 单批文本条数，官方上限 20 |
+| `EMBEDDING_BATCH_SIZE` | 单批文本条数，默认 10。v4/v3 的上限就是 10，超了服务端直接 400 |
 | `LLM_TIMEOUT` | 单次 LLM 调用超时秒数，默认 120 |
 | `AMAP_API_KEY` | 高德 **Web 服务** Key，会透传给 MCP Server |
 | `MAP_POLYLINE_TOLERANCE_M` | 折线抽稀容差（米），默认 6。被删掉的点到保留折线的偏离不超过该值，所以路径形状不变；设 0 关闭几何抽稀。**不能留空**，留空启动会报 `ValueError` |
@@ -321,15 +378,30 @@ python run.py
 
 ### 4. 初始化 RAG 向量库（首次运行必须）
 
+内置语料是 125 份 PDF 攻略，分两步构建。**抽取产物已经提交在仓库里**，所以正常安装只需要跑第二步（嵌入）：
+
 ```bash
 cd backend
-python -m app.rag.init_rag_database          # 清空旧库后重建（默认）
-python -m app.rag.init_rag_database --keep   # 保留旧库，追加写入
+python scripts/build_corpus.py index --rebuild     # JSON → 向量库，约 2 分钟
 ```
 
-会读取 `app/data/travel_guide/` 下的全部 Markdown 攻略，按标题层级分块后写入 Chroma。
+如果需要从原始 PDF 重新抽取（换了分块策略、加了新语料）：
 
-> **换了 embedding 模型或改了维度，必须重跑本脚本。** 不同模型产出的向量不在同一语义空间，混在一个 collection 里不会报错，只会让检索结果静默变差。默认行为就是整库重建，`--keep` 仅用于追加语料。
+```bash
+python scripts/build_corpus.py extract --src "E:/旅行攻略"   # PDF → JSON，约 50 分钟
+python scripts/build_corpus.py index --rebuild
+python scripts/build_corpus.py stats                         # 看语料概况
+```
+
+`extract` 支持断点续传：已抽取且内容未变的文件会跳过，中断后重跑接着来。
+
+> **为什么分两步**：这批 PDF 里 54% 的文字层是坏的（内嵌字体映射错位），必须走 OCR，实测 2.6 秒/页。抽取固化后，调分块参数、换 embedding 模型、重建库都只需要秒级的第二步，不用再付那 50 分钟。
+>
+> **换了 embedding 模型或改了维度，必须重跑 `index --rebuild`。** 不同模型产出的向量不在同一语义空间，混在一个 collection 里不会报错，只会让检索结果静默变差。
+>
+> 重建后需要重启服务：检索进程缓存了库里的目的地列表，不重启会用旧的过滤条件。
+
+`app/rag/init_rag_database.py` 是 Markdown 语料的旧入口，仍可用，但跑它会把公共库重建成「只有 `travel_guide/` 下那几份 md」的状态。
 
 ### 5. 启动前端
 
@@ -506,7 +578,7 @@ python evals/run_evals.py --limit 3          # 冒烟
 
 ## 已知限制与后续计划
 
-- **内置 RAG 知识库只有 1 篇示例攻略**：检索效果受限。用户可以自己上传 PDF 补充，但内置语料本身还是没扩（扩充语料是内容工程，不是算法工程）
+- **内置语料只到目的地粒度**：123 个目的地，冷门县市没有对应语料（`trap_lintan_county` 这类用例仍然靠模型先验答对）。检索按目的地精确过滤，「云南」不会自动带出「昆明」——省市归属表还没建，宁可少做也不编一张错表
 - **资料库只吃 PDF**：扫描件靠 OCR 兜底，但不是所有 PDF 都能救回来——加密、无文字层且 OCR 也识别不出的会被判失败并给出原因
 - **有测试，但没有 CI**：`backend/tests/` 覆盖折线抽稀的几何正确性，`backend/evals/` 是 20 条端到端评测；两者都靠手动触发，没接 GitHub Actions
 - **暂无容器化部署**
