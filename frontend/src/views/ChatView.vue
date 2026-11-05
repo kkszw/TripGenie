@@ -247,7 +247,21 @@
           <!-- 底部工具栏 -->
           <div class="input-toolbar">
             <div class="toolbar-left">
-              <!-- 这里可以放快捷按钮 -->
+              <!-- 资料库入口。放在输入框左下角，和"这次对话要用什么材料"的
+                   动作在同一个视线区域里。 -->
+              <button
+                  class="tool-btn"
+                  :class="{ active: showKnowledge }"
+                  title="我的资料（上传 PDF）"
+                  @click="showKnowledge = true"
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
+                     stroke="currentColor" stroke-width="1.8">
+                  <path d="M21 11.5 12.6 20a5 5 0 0 1-7-7l8.4-8.4a3.4 3.4 0 0 1 4.8 4.8l-8.3 8.4a1.8 1.8 0 0 1-2.5-2.5l7.6-7.7"
+                        stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span>资料</span>
+              </button>
             </div>
             <div class="toolbar-right">
               <!-- 生成中：同一个位置换成「停止」。放同一个位置而不是另加按钮，
@@ -310,6 +324,9 @@
       </div>
     </nav>
 
+    <!-- 资料库面板：与对话解耦，传进来的资料是跨会话复用的 -->
+    <KnowledgePanel :visible="showKnowledge" @close="showKnowledge = false"/>
+
   </div>
 </template>
 
@@ -320,6 +337,7 @@ import {useSessions} from "@/composables/useSessions.js";
 import {useAuth} from "@/composables/useAuth.js";
 import TripPlanCard from '@/components/chat/TripPlanCard.vue'
 import TripPlanModal from '@/components/chat/TripPlanModal.vue'
+import KnowledgePanel from '@/components/chat/KnowledgePanel.vue'
 
 const props = defineProps({
   threadId: {
@@ -355,6 +373,7 @@ const currentThreadId = ref(props.threadId)
 // ===== 弹窗状态 =====
 const showModal = ref(false)
 const selectedPlan = ref(null)
+const showKnowledge = ref(false)
 
 // ===== 显示行程详情（打开弹窗） =====
 const showPlanDetail = (plan) => {
@@ -2382,6 +2401,32 @@ onUnmounted(() => {
 .toolbar-left {
   display: flex;
   gap: 4px;
+}
+
+/* 工具栏上的次级按钮（资料库）：默认低调，悬停才浮出来，不抢发送键的注意力 */
+.tool-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 10px;
+  border: none;
+  border-radius: 14px;
+  background: transparent;
+  color: #8b93a5;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.tool-btn:hover {
+  background: #eef0f5;
+  color: #4f6ef7;
+}
+
+.tool-btn.active {
+  background: #eef2ff;
+  color: #4f6ef7;
 }
 
 .toolbar-right {

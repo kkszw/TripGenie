@@ -53,6 +53,9 @@ class TripState(TypedDict):
 
     # 对话相关
     thread_id: Optional[str]
+    # user_id：检索用户自己上传的资料时要按它过滤。只能从登录令牌注入，
+    # 不能来自请求体——否则任何人都能指定别人的 user_id 去检索别人的资料。
+    user_id: NotRequired[Optional[str]]
     # 必须带 add_messages reducer：不带 reducer 时节点返回 {"messages": [...]}
     # 是"整体覆盖"，chat 节点一返回带 tool_calls 的 AI 消息就会把历史和本轮用户
     # 问题一起清掉，tool_node 拿到的只剩 [AI(tool_calls)]，最终回复不知道用户问了什么。

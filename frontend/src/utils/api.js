@@ -139,6 +139,62 @@ export const api = {
         return response.json();
     },
 
+    // ===== 资料库（用户上传的 PDF） =====
+
+    // 上传 PDF。刻意不设 Content-Type：FormData 的 boundary 必须由浏览器生成，
+    // 手写 multipart/form-data 会丢掉 boundary，后端直接解析失败。
+    uploadDoc: async function (file) {
+        const form = new FormData();
+        form.append('file', file);
+
+        const response = await fetch(`${API_BASE}/api/knowledge/upload`, {
+            method: 'POST',
+            headers: authHeaders(),
+            body: form
+        });
+
+        if (!response.ok) {
+            onUnauthorized(response);
+            throw await toError(response, '上传失败');
+        }
+        return response.json();
+    },
+
+    getDocs: async function () {
+        const response = await fetch(`${API_BASE}/api/knowledge/`, {
+            headers: authHeaders()
+        });
+        if (!response.ok) {
+            onUnauthorized(response);
+            throw await toError(response, '获取资料列表失败');
+        }
+        return response.json();
+    },
+
+    // 轮询单条资料的入库进度
+    getDoc: async function (docId) {
+        const response = await fetch(`${API_BASE}/api/knowledge/${docId}`, {
+            headers: authHeaders()
+        });
+        if (!response.ok) {
+            onUnauthorized(response);
+            throw await toError(response, '获取资料状态失败');
+        }
+        return response.json();
+    },
+
+    deleteDoc: async function (docId) {
+        const response = await fetch(`${API_BASE}/api/knowledge/${docId}`, {
+            method: 'DELETE',
+            headers: authHeaders()
+        });
+        if (!response.ok) {
+            onUnauthorized(response);
+            throw await toError(response, '删除资料失败');
+        }
+        return response.json();
+    },
+
     // ===== 消息管理 =====
 
     // 获取会话消息

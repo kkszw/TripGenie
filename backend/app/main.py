@@ -4,11 +4,12 @@ import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.api import auth, chat, history
+from app.api import auth, chat, history, knowledge
 from app.core.llm import ensure_tools
 from app.core.langgraph_app import get_workflow
 from app.core.checkpointer import get_checkpointer
 from app.core.logging import adopt_uvicorn_loggers, get_logger, setup_logging
+from app.services.database import db
 
 # 尽量早：之后任何模块第一行日志都能落文件、带 trace_id
 setup_logging()
@@ -33,6 +34,7 @@ app.add_middleware(
 app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(history.router, prefix="/api/history", tags=["history"])
+app.include_router(knowledge.router, prefix="/api/knowledge", tags=["knowledge"])
 
 
 @app.on_event("startup")
@@ -41,6 +43,11 @@ async def startup():
     # 初始化 LangGraph 工作流（进程内单例，chat.py 复用同一个实例）
     app.state.workflow = await get_workflow()
     app.state.checkpointer = await get_checkpointer()
+
+    # 上一次进程退出时没跑完的入库任务：后台协程随进程一起没了，数据库里
+    # 那条记录还停在 parsing/indexing。不清理的话前端会对着一个永远不会
+    # 变化的状态无限轮询。
+    db.reset_stale_knowledge_docs()
 
     # 预热 MCP 工具清单：首次拉取要起两个 uvx 子进程（约 2s），
     # 放到后台任务里做，不拖慢启动，也不让第一条消息承担这份开销。

@@ -115,8 +115,16 @@ class TokenTest(unittest.TestCase):
 
     def test_tampered_token_is_rejected(self):
         token = create_access_token("user-1", "alice")
-        # 改签名段的最后一个字符，payload 不动
-        tampered = token[:-1] + ("A" if token[-1] != "A" else "B")
+        # 改签名段的**中间**字符，payload 不动。
+        #
+        # 不能改最后一个字符：HS256 签名是 32 字节，base64url 编码后 43 个字符，
+        # 43×6 = 258 位，而有效位只有 256 —— 最后一个字符的低 2 位是填充位，
+        # 解码时被丢弃。所以"换掉末位字符"有概率解出完全相同的签名字节，
+        # 令牌仍然有效，这条断言就会偶发失败（实测四次跑挂一次）。
+        head, _, signature = token.rpartition(".")
+        middle = len(signature) // 2
+        flipped = "A" if signature[middle] != "A" else "B"
+        tampered = f"{head}.{signature[:middle]}{flipped}{signature[middle + 1:]}"
         self.assertIsNone(decode_access_token(tampered))
 
     def test_wrong_secret_is_rejected(self):

@@ -51,6 +51,8 @@ backend/data/
 backend/app/data/chroma_db/
 backend/app/data/checkpoints/
 backend/app/data/history.json
+# 用户上传的 PDF 原件：可能包含个人信息，绝不能进版本库
+backend/app/data/uploads/
 *.db
 *.db-shm
 *.db-wal

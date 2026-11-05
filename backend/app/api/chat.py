@@ -241,6 +241,9 @@ async def _run_stream(thread_id: str,
             graph_input = TripState(
                 user_input=user_message or "",
                 thread_id=thread_id,
+                # 检索节点要按 user_id 找用户自己上传的资料。来源是令牌，
+                # 不是请求体，用户改不了。
+                user_id=user_id,
                 messages=messages,
                 start_date=date.today().isoformat(),  # YYYY-MM-DD
             )

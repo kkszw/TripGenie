@@ -32,12 +32,14 @@ async def retrieve_guides(state: TripState, config: RunnableConfig = None):
         # （SSE 心跳、其它请求一起卡住），丢到线程池里执行。
         # 只取已格式化的 context 文本：原来把 List[Document] 直接塞进 prompt，
         # 发给模型的是 `[Document(page_content='...', metadata={...})]` 的 Python repr。
-        ctx = await asyncio.to_thread(retrieve_context, query, top_k=5)
+        # user_id 让检索额外覆盖用户自己上传的资料（没有则只查内置攻略库）。
+        ctx = await asyncio.to_thread(
+            retrieve_context, query, top_k=5, user_id=state.get("user_id"))
         if writer:
             writer({
                 "type": "node_end",
                 "node": "📚 检索攻略",
-                "message": f"找到 {len(ctx.get('docs') or [])} 篇攻略"
+                "message": f"找到 {len(ctx.get('docs') or [])} 篇资料"
             })
         return {"similar_guides": ctx.get("context", "")}
     except Exception as e:
@@ -59,12 +61,13 @@ async def search_attractions_node(state: TripState, config: RunnableConfig = Non
         })
     try:
         query = f"{state['destination']}的景点推荐,喜好：{' '.join(state.get('preferences'))}"
-        ctx = await asyncio.to_thread(retrieve_context, query, top_k=5)
+        ctx = await asyncio.to_thread(
+            retrieve_context, query, top_k=5, user_id=state.get("user_id"))
         if writer:
             writer({
                 "type": "node_end",
                 "node": "📚 搜索景点",
-                "message": f"找到 {len(ctx.get('docs') or [])} 篇攻略"
+                "message": f"找到 {len(ctx.get('docs') or [])} 篇资料"
             })
         return {"attractions_pool": ctx.get("context", "")}
     except Exception as e:
