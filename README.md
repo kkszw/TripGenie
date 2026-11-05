@@ -199,6 +199,22 @@ python scripts/build_corpus.py index --skip-existing          # 中断后接着�
 
 语料只有十几份时这个差距是 86.2% → 100%（+13.7pt）；灌满 125 份之后掉到 55.4%——因为模板雷同的文档越多，向量空间里挤得越紧，不按目的地过滤时有一半上下文来自别的城市，而 LLM 会照着这些段落编行程。
 
+**过滤解决「串城」，混合检索解决「精确地名」。** 但过滤一开，`local@5` 就顶满 100%，这个指标再也区分不出检索准不准。所以另设一个：从每个目的地的语料里挑一个**只有它才有**的具体地名（「亚龙湾」「田子坊」「西海岸」），用「XX 怎么去，有什么好玩的」提问，统计 top-5 里真含这个词的块占比。
+
+| 配置 | local@5 | term@5 | 全量耗时 |
+|---|---|---|---|
+| 全库 · 纯向量 | 55.4% | 42.4% | 44.7s |
+| 目的地过滤 · 纯向量 | 100.0% | 70.7% | 44.0s |
+| 目的地过滤 · 混合检索 | **100.0%** | **90.1%** | 46.1s |
+
+这批语料全是地名、店名、路名，向量模型会把「第一市场」和同主题的「亚龙湾」算得很像，而用户真问「第一市场几点开门」时只有精确提到那一段的块才答得上来。这是 embedding 的结构性弱点，换个更大的模型也不解决。BM25 在本地跑，单次查询 0.2~1ms，比向量检索快两个数量级，融合后总耗时只多了 4.8%（+2.1 秒 / 246 次查询）。
+
+融合用 RRF 而不是加权分数：向量的 l2 距离和 BM25 分数不在一个量纲上，加权要先归一化，而归一化依赖候选集分布——换一批候选权重就失效。RRF 只用排名（`Σ 1/(60+rank)`），没有要调的参数。
+
+**为什么不是 rerank。** `qwen3.7-text-rerank` 和 `gte-rerank-v2` 在当前账户上都是 403 `Model.AccessDenied`——是模型没开通，不是钱的问题（欠费那阵子报的也是这个，容易混）。重排是 cross-encoder，通常比 BM25 准，但它要额外一次网络往返加模型授权；混合检索纯本地、零成本、无外部依赖，先落地这个。等 rerank 开通了，它可以挂在融合之后做精排，两者不冲突。
+
+**索引有三层缓存，缺一层就出问题。** 进程内缓存（稳态零开销）→ 磁盘 pickle（重启只加载不重建）→ Chroma 指纹校验。缓存键必须用**文档 id 集合的哈希**，不能用库代际号：`index --skip-existing` 是增量写入，不走 `reset_collection`，代际号不变但内容确实变了，只认代际号会读到过期索引且不报错。校验本身要 95ms（取 4074 个 id），所以有 15 秒的校验间隔——否则每个查询都白付 0.1 秒，实测这让混合检索整轮慢了 3 倍（148s vs 46s）。
+
 **断点续传与并行。** `extract` 按内容 sha256 判断是否已抽过，中断后重跑接着来，不会重新 OCR。分片参数 `--shard i/n` 是为多机准备的——**单机多开没有收益**，实测两个进程并行时单份 OCR 从 58 秒涨到 129 秒，吞吐基本不变，因为 onnxruntime 默认已经占满所有核心。
 
 ---
@@ -238,7 +254,7 @@ flowchart TD
 | Agent 编排 | LangGraph（StateGraph / 条件边 / 并行扇出 / Checkpointer） |
 | 工具协议 | MCP（`langchain-mcp-adapters`，stdio transport） |
 | 大模型 | DeepSeek（`deepseek-flash`，通过 OpenAI 兼容端点接入）；`with_structured_output` 做意图分类 |
-| RAG | Chroma 向量库、`text-embedding-v4`（百炼 OpenAI 兼容模式，1024 维）、125 份内置攻略（文字层 + OCR 回退 → 按「天/页」分块，带目的地元数据） |
+| RAG | Chroma 向量库、`text-embedding-v4`（百炼 OpenAI 兼容模式，1024 维）、125 份内置攻略（文字层 + OCR 回退 → 按「天/页」分块，带目的地元数据）、BM25 关键词索引 + RRF 混合检索 |
 | 后端 | Python 3.12+、FastAPI、SSE、asyncio |
 | 存储 | SQLite（业务库 + LangGraph 检查点） |
 | 前端 | Vue 3（Composition API）、Vite、原生 ReadableStream 解析 SSE、高德地图 JS API |
@@ -275,7 +291,7 @@ TripGenie/
 │       │   └── checkpointer.py       # LangGraph SQLite 检查点
 │       ├── mcp/
 │       │   └── client.py             # MCP Server 接入与工具合并
-│       ├── rag/                     # 文档加载 / 分块 / 向量库 / 检索
+│       ├── rag/                     # 文档加载 / 分块 / 向量库 / 检索（含 BM25 关键词索引）
 │       ├── services/                 # 会话库、天气、高德接口、地图数据、折线抽稀、PDF 抽取与语料清洗
 │       ├── models/                   # 请求 / 响应模型
 │       └── data/                     # 语料（corpus JSON / Markdown）、向量库、城市编码表、会话数据库
@@ -336,6 +352,7 @@ cp .env.example .env          # Windows: copy .env.example .env
 | `EMBEDDING_DIMENSIONS` | 向量维度，可选 `256/512/768/1024`，默认 1024。改了必须重建向量库 |
 | `EMBEDDING_COLLECTION` | Chroma collection 名，带模型标识；换模型时同步改，避免新老向量混库 |
 | `EMBEDDING_BATCH_SIZE` | 单批文本条数，默认 10。v4/v3 的上限就是 10，超了服务端直接 400 |
+| `HYBRID_SEARCH` | `true`（默认）/ `false`。关掉退回纯向量检索，用来做 A/B |
 | `LLM_TIMEOUT` | 单次 LLM 调用超时秒数，默认 120 |
 | `AMAP_API_KEY` | 高德 **Web 服务** Key，会透传给 MCP Server |
 | `MAP_POLYLINE_TOLERANCE_M` | 折线抽稀容差（米），默认 6。被删掉的点到保留折线的偏离不超过该值，所以路径形状不变；设 0 关闭几何抽稀。**不能留空**，留空启动会报 `ValueError` |

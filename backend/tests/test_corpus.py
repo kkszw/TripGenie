@@ -378,9 +378,14 @@ class DestinationFilterTest(unittest.TestCase):
             retriever, "known_destinations",
             return_value=["大连", "沈阳", "九寨沟", "香港", "香港购物"])
         self._patcher.start()
+        # 这里只测「过滤 + 合并」，关键词路由 test_hybrid 单独覆盖。
+        # 不隔离的话它会去读真实 Chroma 索引，把断言用的假数据顶掉。
+        self._kw_patcher = mock.patch.object(retriever, "_keyword_ranking", return_value=[])
+        self._kw_patcher.start()
 
     def tearDown(self):
         self._patcher.stop()
+        self._kw_patcher.stop()
 
     def test_exact_match(self):
         self.assertEqual(retriever.match_destinations("沈阳"), ["沈阳"])

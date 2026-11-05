@@ -15,12 +15,18 @@
 这批攻略是同一家出的同一套模板，「交通·TRANSPORTATION」「有问必答·FAQ」
 「亮点·HIGH LIGHTS」这些章节标题逐字相同，向量空间里挤成一团。
 不过滤的话，问大连会拿回三亚的交通段落——内容看着很专业，其实是错的。
+
+再往上一层是**混合检索**：向量路 + BM25 关键词路，用 RRF 融合。理由是
+这批语料里全是地名、店名、路名（「第一市场」「鹿回头」「胜利路410号」），
+向量模型会把它们和同主题的段落算得很像，而用户问「第一市场几点开门」时
+只有精确提到那一段的块才答得上来。BM25 补的正是这个短板，见 keyword_index.py。
 """
 from typing import Any, Dict, List, Optional
 from math import ceil
 
 from langchain_core.documents import Document
 
+from app.config import settings
 from app.core.logging import get_logger
 from app.rag.vector_store import get_generation, get_vector_store
 
@@ -29,6 +35,12 @@ logger = get_logger(__name__)
 # 单份资料最多贡献几块。取 2 是因为 top_k 通常是 5：
 # 给用户资料留 2 个名额，公共库还有 3 个，两边都能说话。
 MAX_PER_DOC = 2
+
+# RRF 的平滑常数。60 是原论文的实验取值，也是 Elasticsearch 的默认值：
+# 它让「第 1 名」和「第 2 名」的差距（1/61 vs 1/62）远小于「出现过」和
+# 「没出现过」的差距，所以多路都命中的块会稳定胜出，而不是被某一路的
+# 绝对分数带跑。
+RRF_K = 60
 
 # 公共库里出现过的目的地。第一次检索时聚合一次，之后进程内复用 ——
 # 几千条 metadata 全取一遍要几十毫秒，每次查询都做没必要。
@@ -144,11 +156,85 @@ def _doc_key(doc: Document) -> str:
     return str(meta.get("doc_id") or meta.get("source") or meta.get("filename") or "")
 
 
-def _merge(candidates: List[tuple], top_k: int, max_per_doc: int) -> List[Document]:
-    """按距离合并、去重、限额。
+def _content_key(doc: Document) -> str:
+    """跨路去重用的正文指纹。
 
-    candidates 里的元素是 (doc, distance)。排序用距离升序；同分时保持原序
-    （Python 的 sort 是稳定的），公共库在前，与旧行为一致。
+    向量路和关键词路会命中同一块，融合时按正文前缀合并，不能按 id——
+    Chroma 的块 id 是随机 uuid，两条路拿到的是同一个 id，但用户库与公共库
+    之间可能真是不同块而正文相同（转载内容），那种也该只留一条。
+    """
+    return doc.page_content.strip()[:200]
+
+
+def _matches(meta: Dict, where: Optional[Dict]) -> bool:
+    """把 Chroma 风格的最小过滤子集用在本地索引上。
+
+    只支持本模块实际用到的两种形式：等值和 $in。写成一个通用求值器反而
+    会掩盖「过滤到底做了什么」这件事——目的地过滤是这个模块的核心机制，
+    它应该一眼能读懂。
+    """
+    if not where:
+        return True
+    for field, cond in where.items():
+        value = (meta or {}).get(field)
+        if isinstance(cond, dict) and "$in" in cond:
+            if value not in cond["$in"]:
+                return False
+        elif value != cond:
+            return False
+    return True
+
+
+def _keyword_ranking(query: str, top_k: int, scope: str,
+                     where: Optional[Dict] = None) -> List[Document]:
+    """关键词路召回，按 BM25 分数降序返回。
+
+    索引建失败（用户库空、Chroma 读不到）就返回空——混合检索退化成纯向量，
+    不能因为一个增强项没准备好就让整次规划失败。
+    """
+    from app.rag.keyword_index import get_index
+
+    try:
+        index = get_index(scope)
+        if not index or not index.docs:
+            return []
+        allow = (lambda pos: _matches(index.docs[pos].metadata, where)) if where else None
+        return [index.docs[pos] for pos, _score in index.search(query, top_k, allow=allow)]
+    except Exception as exc:
+        # 关键词路是增强项：索引建不出来、读坏了，都退回纯向量。
+        # 让它把整次规划带走是本末倒置——没有它检索仍然能用，只是差一些。
+        logger.debug("关键词检索失败，本次只用向量路", extra={"err": str(exc)})
+        return []
+
+
+def _rrf(rankings: List[List[Document]]) -> List[tuple]:
+    """Reciprocal Rank Fusion，返回 [(doc, fused_score)]，分数越大越相关。
+
+    只吃排名、不吃分数：向量的 l2 距离和 BM25 分数不在一个量纲上，
+    要加权就得先归一化，而归一化依赖候选集分布——换一批候选权重就失效。
+    RRF 没有这个问题，也没有需要调的参数。
+    """
+    fused: Dict[str, list] = {}
+    for ranking in rankings:
+        for rank, doc in enumerate(ranking, start=1):
+            key = _content_key(doc)
+            entry = fused.get(key)
+            if entry is None:
+                fused[key] = [doc, 1.0 / (RRF_K + rank)]
+            else:
+                entry[1] += 1.0 / (RRF_K + rank)
+    # 同一块在两路都排得靠前 → 分数累加，稳定胜出
+    return sorted(((doc, score) for doc, score in fused.values()),
+                  key=lambda pair: -pair[1])
+
+
+def _merge(candidates: List[tuple], top_k: int, max_per_doc: int,
+           higher_is_better: bool = False) -> List[Document]:
+    """按分数合并、去重、限额。
+
+    candidates 里的元素是 (doc, score)。higher_is_better=False 用于向量路
+    （l2 距离，越小越相近），True 用于 RRF 融合分数（越大越相关）。
+    同分时保持原序（Python 的 sort 是稳定的），公共库在前，与旧行为一致。
 
     限额是自适应的，不是写死 2：`max(MAX_PER_DOC, ceil(top_k / 份数))`。
     写死 2 踩过一次 —— 公共语料目前只有一份大连攻略，一次查询的候选全来自
@@ -168,10 +254,13 @@ def _merge(candidates: List[tuple], top_k: int, max_per_doc: int) -> List[Docume
     seen_content: set = set()
     per_doc: Dict[str, int] = {}
 
-    for doc, _distance in sorted(candidates, key=lambda pair: pair[1]):
+    def ordered():
+        return sorted(candidates, key=lambda pair: pair[1], reverse=higher_is_better)
+
+    for doc, _score in ordered():
         if len(picked) >= top_k:
             break
-        content_key = doc.page_content.strip()[:200]
+        content_key = _content_key(doc)
         if content_key in seen_content:
             continue
 
@@ -189,10 +278,10 @@ def _merge(candidates: List[tuple], top_k: int, max_per_doc: int) -> List[Docume
     # 这么做不会破坏多样性：第一轮已经保证每份资料都拿到了名额，这一轮只是
     # 把剩下的空位用次优候选填满，少一条上下文并不会让答案更"中立"。
     if len(picked) < top_k:
-        for doc, _distance in sorted(candidates, key=lambda pair: pair[1]):
+        for doc, _score in ordered():
             if len(picked) >= top_k:
                 break
-            content_key = doc.page_content.strip()[:200]
+            content_key = _content_key(doc)
             if content_key in seen_content:
                 continue
             seen_content.add(content_key)
@@ -220,14 +309,29 @@ def retrieve_context(query: str, top_k: int = 5,
     # 每一路多要一些候选，合并后才有裁剪余地。只按 top_k 取两路，
     # 合并时一旦触发去重/限额，最终数量会少于 top_k。
     fetch_k = max(top_k * 2, 10)
+    hybrid = settings.hybrid_search
 
     matched = match_destinations(destination)
-    candidates: List[tuple] = []
 
+    # vector_candidates 保留 (doc, distance)，纯向量模式要用它按距离排序；
+    # rankings 只存排好序的文档列表，给 RRF 用。两者同时维护而不是二选一，
+    # 是因为 hybrid 开关要能在配置里改，两条路径都必须随时可用。
+    vector_candidates: List[tuple] = []
+    rankings: List[List[Document]] = []
+
+    def _take(pairs: List[tuple], where: Optional[Dict], scope: str) -> None:
+        vector_candidates.extend(pairs)
+        rankings.append([doc for doc, _ in pairs])
+        if hybrid:
+            keyword = _keyword_ranking(query, fetch_k, scope, where)
+            if keyword:
+                rankings.append(keyword)
+
+    # ---- 公共库 ----
     if matched:
+        where = {"destination": {"$in": matched}}
         try:
-            candidates += _search(query, fetch_k, "public",
-                                  where={"destination": {"$in": matched}})
+            _take(_search(query, fetch_k, "public", where=where), where, "public")
         except Exception as exc:
             # 过滤语法/字段缺失等问题不该让规划直接失败，退回全库检索
             logger.warning("目的地过滤检索失败，退回全库",
@@ -235,27 +339,43 @@ def retrieve_context(query: str, top_k: int = 5,
             matched = []
 
     if not matched:
-        candidates += _search(query, fetch_k, "public")
+        _take(_search(query, fetch_k, "public"), None, "public")
 
+    # ---- 用户自己的资料 ----
     if user_id:
         try:
-            candidates += _search(query, fetch_k, "user", where={"user_id": user_id})
+            where = {"user_id": user_id}
+            _take(_search(query, fetch_k, "user", where=where), where, "user")
         except Exception as exc:
             # 用户库还没建（从没人上传过资料）时 collection 不存在，
             # 不该让整次规划因为没有资料而失败。
             logger.debug("用户资料检索跳过", extra={"user_id": user_id, "err": str(exc)})
 
-    docs = _merge(candidates, top_k, MAX_PER_DOC)
+    if hybrid and len(rankings) > 1:
+        docs = _merge(_rrf(rankings), top_k, MAX_PER_DOC, higher_is_better=True)
+    else:
+        docs = _merge(vector_candidates, top_k, MAX_PER_DOC)
 
     # 该目的地的语料不够填满上下文时，放开到全库补齐。两种情况都会走到：
     #   1. 库里根本没有这个地方（125 份覆盖了主要旅游地，但不可能全覆盖）
     #   2. 用户问的是「从成都怎么去九寨沟」，需要出发地的交通章节
     # 补齐用的是同一个 top_k 之外的剩余名额，不会把已经选中的本地块挤掉。
     if matched and len(docs) < top_k:
-        seen = {doc.page_content.strip()[:200] for doc in docs}
-        extra = [(doc, score) for doc, score in _search(query, fetch_k, "public")
-                 if doc.page_content.strip()[:200] not in seen]
-        docs += _merge(extra, top_k - len(docs), MAX_PER_DOC)
+        seen = {_content_key(doc) for doc in docs}
+        wide_vec = _search(query, fetch_k, "public")
+        if hybrid:
+            wide = [[doc for doc, _ in wide_vec if _content_key(doc) not in seen]]
+            wide_kw = [doc for doc in _keyword_ranking(query, fetch_k, "public")
+                       if _content_key(doc) not in seen]
+            if wide_kw:
+                wide.append(wide_kw)
+            extra = [(doc, score) for doc, score in _rrf(wide)
+                     if _content_key(doc) not in seen]
+            docs += _merge(extra, top_k - len(docs), MAX_PER_DOC, higher_is_better=True)
+        else:
+            extra = [(doc, score) for doc, score in wide_vec
+                     if _content_key(doc) not in seen]
+            docs += _merge(extra, top_k - len(docs), MAX_PER_DOC)
 
     sources = list({_source_label(doc) for doc in docs})
 

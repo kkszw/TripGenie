@@ -51,6 +51,8 @@ backend/data/
 backend/app/data/chroma_db/
 backend/app/data/checkpoints/
 backend/app/data/history.json
+# BM25 索引缓存：6 MB 二进制，由关键词检索首次调用时自动重建，不需要提交
+backend/app/data/cache/
 # 用户上传的 PDF 原件：可能包含个人信息，绝不能进版本库
 backend/app/data/uploads/
 *.db

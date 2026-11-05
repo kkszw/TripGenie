@@ -38,6 +38,11 @@ class Settings(BaseSettings):
     # collection 名带上模型标识：换模型时新老向量不能混在同一个 collection
     embedding_collection: str = os.getenv("EMBEDDING_COLLECTION", "trip_guides_v4")
 
+    # ===== 检索 =====
+    # 混合检索（向量 + BM25，RRF 融合）。关掉就退回纯向量，
+    # 留着这个开关是为了能一条命令做 A/B，而不是改代码再改回来。
+    hybrid_search: bool = os.getenv("HYBRID_SEARCH", "true").lower() in ("1", "true", "yes")
+
     DASHSCOPE_API_KEY: str = os.getenv("DASHSCOPE_API_KEY", "")
 
     # ===== 登录认证 =====
@@ -83,9 +88,18 @@ class Settings(BaseSettings):
     # 每次规划结束是否往 logs/runs.jsonl 追加一行摘要
     run_log_enabled: bool = os.getenv("RUN_LOG_ENABLED", "true").lower() in ("1", "true", "yes")
     # LLM 单价（元 / 百万 token），用于估算成本。
-    # 留 0 表示只统计 token 不折算金额 —— 单价会变，写死在代码里就是定时炸弹。
-    llm_input_price: float = float(os.getenv("DEEPSEEK_INPUT_PRICE", "0"))
-    llm_output_price: float = float(os.getenv("DEEPSEEK_OUTPUT_PRICE", "0"))
+    #
+    # 分三档而不是一个数，因为 DeepSeek 的输入价按缓存命中与否差 50 倍：
+    # 命中 0.02~0.04，未命中 1~2。本项目 system prompt + 攻略上下文每次都是几千
+    # 字重复前缀，实测第二轮就有 3072/3322 命中，不分档会把成本高估好几倍。
+    #
+    # 下面填的是**高峰时段**价（工作日 9:00-12:00、14:00-18:00）。空闲时段是
+    # 高峰的一半，由 llm_offpeak_ratio 折算，不用改这里。价格会变，改 .env 即可。
+    llm_input_price: float = float(os.getenv("DEEPSEEK_INPUT_PRICE", "2.0"))
+    llm_output_price: float = float(os.getenv("DEEPSEEK_OUTPUT_PRICE", "8.0"))
+    llm_cache_hit_price: float = float(os.getenv("DEEPSEEK_CACHE_HIT_PRICE", "0.04"))
+    # 空闲时段相对高峰的折扣。DeepSeek 官方是 0.5。
+    llm_offpeak_ratio: float = float(os.getenv("DEEPSEEK_OFFPEAK_RATIO", "0.5"))
 
     class Config:
         env_file = ".env"

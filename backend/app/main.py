@@ -37,6 +37,19 @@ app.include_router(history.router, prefix="/api/history", tags=["history"])
 app.include_router(knowledge.router, prefix="/api/knowledge", tags=["knowledge"])
 
 
+def _build_keyword_index() -> None:
+    """在后台线程里把 BM25 索引建好。
+
+    单独抽出来是为了能被 asyncio.to_thread 调用：索引是纯 CPU 活，
+    直接在协程里跑会把事件循环卡住 10 秒，所有请求一起等待。
+    """
+    from app.rag.keyword_index import get_index
+
+    index = get_index("public")
+    if index:
+        logger.info("BM25 索引预热完成", extra={"docs": index.total})
+
+
 @app.on_event("startup")
 async def startup():
     """启动时初始化"""
@@ -59,6 +72,22 @@ async def startup():
                            extra={"err": str(e)})
 
     asyncio.create_task(_warmup_tools())
+
+    # 预热 BM25 索引。首次要分词 4074 块（约 10 秒），放在启动后的后台线程里，
+    # 否则这份开销会落在第一个用户的第一次检索上——他会看到 10 秒的停顿，
+    # 而不是一条"正在检索"的进度提示。
+    async def _warmup_bm25():
+        if not settings.hybrid_search:
+            return
+        try:
+            # 纯 CPU 活，扔到线程里才不会卡住事件循环
+            await asyncio.to_thread(_build_keyword_index)
+        except Exception as e:
+            logger.warning("BM25 索引预热失败（不影响启动，首次检索时会重建）",
+                           extra={"err": str(e)})
+
+    asyncio.create_task(_warmup_bm25())
+
     # uvicorn 在启动时给自己的 logger 单独挂了 handler，摘掉才能让它的
     # 启动/报错日志也走我们的格式（带 trace_id、同时落文件）
     adopt_uvicorn_loggers()

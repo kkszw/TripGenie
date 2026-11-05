@@ -326,6 +326,17 @@ def cmd_index(args) -> int:
     print(f"\n写入 {indexed} 份 / {total_chunks} 块，跳过 {skipped} 份，"
           f"耗时 {elapsed / 60:.1f} 分钟")
     print(f"public collection 当前共 {get_collection_stats(scope='public')} 块")
+
+    # 顺手把关键词索引也建好。不建的话第一次检索要现场分词 4000 多块
+    # （约 10 秒），用户会以为是检索慢；而这里建完就落盘，服务启动只加载。
+    try:
+        from app.rag.keyword_index import get_index
+        keyword = get_index("public")
+        if keyword:
+            print(f"BM25 索引就绪（{keyword.total} 块）")
+    except Exception as exc:
+        print(f"  ! BM25 索引构建失败（不影响向量检索，首次检索时会重试）：{exc}")
+
     # 检索侧把「库里有哪几个目的地」缓存在进程内存里（每次查询都聚合一遍
     # 几千条 metadata 不值得）。重建之后不重启，过滤条件还是旧的。
     print("提示：服务正在运行的话需要重启，检索侧的目的地缓存才会刷新")
