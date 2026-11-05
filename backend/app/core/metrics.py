@@ -31,7 +31,27 @@ class LlmCall:
     model: str
     input_tokens: int = 0
     output_tokens: int = 0
+    cache_hit_tokens: int = 0
     duration_ms: float = 0.0
+    # 这次调用发生在高峰还是空闲时段。逐条记而不是在 summary 里判一次：
+    # 一次规划可能跨 18:00，前半段高峰价、后半段空闲价。
+    peak: bool = True
+
+
+# DeepSeek 按时段计价：工作日 9:00-12:00、14:00-18:00 为高峰，其余（含周末）
+# 为高峰价的一半。
+PEAK_WINDOWS = ((9, 12), (14, 18))
+
+
+def is_peak_hour(when: datetime) -> bool:
+    """是否处于高峰时段。
+
+    法定节假日官方也算空闲，但哪几天放假每年都变，离线判断不了；
+    这里按「周末 + 工作日时段」算，最多把节假日当天的成本算高一倍。
+    """
+    if when.weekday() >= 5:
+        return False
+    return any(start <= when.hour < end for start, end in PEAK_WINDOWS)
 
 
 class RunMetrics:
@@ -71,18 +91,22 @@ class RunMetrics:
         self._llm_started[run_id] = time.perf_counter()
 
     def add_llm(self, node: str, model: str, input_tokens: int, output_tokens: int,
-                run_id: Optional[str] = None) -> None:
+                run_id: Optional[str] = None, cache_hit_tokens: int = 0) -> None:
         duration = 0.0
         if run_id:
             start = self._llm_started.pop(run_id, None)
             if start is not None:
                 duration = (time.perf_counter() - start) * 1000
+        # 命中数不可能超过输入总数，多算会算成负数价格
+        hit = max(0, min(cache_hit_tokens or 0, input_tokens or 0))
         self.llm_calls.append(LlmCall(
             node=node or "-",
             model=model or "-",
             input_tokens=input_tokens or 0,
             output_tokens=output_tokens or 0,
+            cache_hit_tokens=hit,
             duration_ms=round(duration, 1),
+            peak=is_peak_hour(datetime.now()),
         ))
 
     def add_tool(self, name: str) -> None:
@@ -112,6 +136,23 @@ class RunMetrics:
             row["out"] += call.output_tokens
         return grouped
 
+    def _cost_cny(self) -> float:
+        """按三档单价 + 时段折扣算成本。
+
+        输入价必须拆成「缓存命中」和「未命中」：两者差 50 倍。只看总输入量
+        按未命中价算，会把一次几千字上下文的规划算成几分钱，实际只要几厘。
+        """
+        total = 0.0
+        for call in self.llm_calls:
+            ratio = 1.0 if call.peak else settings.llm_offpeak_ratio
+            miss = max(0, call.input_tokens - call.cache_hit_tokens)
+            total += (
+                call.cache_hit_tokens * settings.llm_cache_hit_price
+                + miss * settings.llm_input_price
+                + call.output_tokens * settings.llm_output_price
+            ) * ratio
+        return total / 1_000_000
+
     def summary(self) -> Dict[str, Any]:
         total = self.total_ms
         nodes = {
@@ -120,8 +161,8 @@ class RunMetrics:
         }
         input_tokens = sum(c.input_tokens for c in self.llm_calls)
         output_tokens = sum(c.output_tokens for c in self.llm_calls)
-        cost = (input_tokens * settings.llm_input_price
-                + output_tokens * settings.llm_output_price) / 1_000_000
+        cache_hit = sum(c.cache_hit_tokens for c in self.llm_calls)
+        cost = self._cost_cny()
 
         return {
             "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -135,6 +176,10 @@ class RunMetrics:
                 "calls": len(self.llm_calls),
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
+                # 命中率是判断"缓存到底有没有生效"的唯一依据。前缀稳定才有命中，
+                # 一旦有人往 prompt 开头塞时间戳/随机 id，这个数会掉到 0。
+                "cache_hit_tokens": cache_hit,
+                "cache_hit_ratio": round(cache_hit / input_tokens, 3) if input_tokens else 0.0,
                 "cost_cny": round(cost, 6),
                 "by_node": self._llm_by_node(),
             },
@@ -153,6 +198,8 @@ class RunMetrics:
         if llm["calls"]:
             extra["llm_calls"] = llm["calls"]
             extra["tokens"] = f"{llm['input_tokens']}+{llm['output_tokens']}"
+            if llm["cache_hit_tokens"]:
+                extra["cache"] = f"{llm['cache_hit_ratio']:.0%}"
         if llm["cost_cny"]:
             extra["cost_cny"] = llm["cost_cny"]
         if self.tools:

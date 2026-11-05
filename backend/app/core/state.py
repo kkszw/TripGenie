@@ -9,22 +9,30 @@ class IntentOutput(BaseModel):
     intent: Literal["chat", "format_input"] = Field(description="用户意图类型")
 
 
-class Attraction(TypedDict):
-    name: str
-    location: str
-    rating: float
-    description: str
-    visit_duration: int
-    category: str
+class Activity(TypedDict):
+    """单日活动条目。
+
+    字段必须和 core/prompts/plan.py 里 PLAN_TEMPLATE 完全一致——模型就是照
+    那个模板吐 JSON 的。曾经的版本在这里写了 name/location/rating/category，
+    那是"景点"的模型，而实际上一天里除了景点还有午餐、返程、买水果，
+    模型输出的是 time/activity/description/cost。两者从未对齐过，
+    照着类型定义读数据只会读到空。tests/test_plan_structure.py 锁住了这一致性。
+    """
+    time: str           # "09:00-10:30"，排程节点会整段重算
+    activity: str       # 活动描述，含地点全名，地图靠它取坐标
+    description: str    # 说明与实用提示
+    cost: float         # 该条花费（元）
 
 
 class DayPlan(TypedDict):
     day: int
-    attractions: List[Attraction]
-    meals: List[str]
-    hotel: str
-    transport: str
-    budget: float
+    theme: str          # 当天主题，如"初识浪漫之都 · 城市地标与海滨漫步"
+    date: str
+    weather: str
+    activities: List[Activity]
+    notes: str
+    # 驼峰是为了跟模型输出对齐，改名会让每条都要做一次映射，不值得
+    estimatedCost: float
 
 
 class TripState(TypedDict):
@@ -63,8 +71,10 @@ class TripState(TypedDict):
     messages: Annotated[List[Any], add_messages]
 
     # 输出
+    # 只有 draft_plan，没有 final_plan。排程、质检都在原地改写 draft_plan，
+    # 质检通过后它就是最终版。曾经另有 final_plan 字段但没有任何节点写过它，
+    # 读的人（包括我自己）按字面去取只能拿到 None。
     draft_plan: Optional[List[DayPlan]]
-    final_plan: Optional[List[DayPlan]]
     response: str
     map_data: Dict
 

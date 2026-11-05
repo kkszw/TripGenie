@@ -155,13 +155,20 @@ def _record_llm(metrics: RunMetrics, event: dict) -> None:
             usage = {
                 "input_tokens": token_usage.get("prompt_tokens", 0),
                 "output_tokens": token_usage.get("completion_tokens", 0),
+                # DeepSeek 在 response_metadata 这一层给的是自己命名的字段
+                "input_token_details": {
+                    "cache_read": token_usage.get("prompt_cache_hit_tokens", 0),
+                },
             }
 
+    details = usage.get("input_token_details") or {}
     metrics.add_llm(
         node=node,
         model=response_meta.get("model_name") or "-",
         input_tokens=usage.get("input_tokens", 0) or 0,
         output_tokens=usage.get("output_tokens", 0) or 0,
+        # 输入价按「命中 / 未命中」差 50 倍，不传这一项成本会高估几倍
+        cache_hit_tokens=details.get("cache_read", 0) or 0,
         run_id=event.get("run_id"),
     )
 

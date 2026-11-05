@@ -23,10 +23,15 @@ from app.core import llm as llm_runtime  # noqa: E402
 from app.core.nodes.plan import generate_plan_node  # noqa: E402
 from app.core.nodes.slots import format_input  # noqa: E402
 
-BAD_JSON = '好的，我给您排了行程：{"days": [{"day": 1, "attractions": ['
+BAD_JSON = '好的，我给您排了行程：{"days": [{"day": 1, "activities": ['
+# 字段照 prompts/plan.py 里的 PLAN_TEMPLATE 写，不要退回 attractions/name：
+# 模型从来不输出那套键，用它做测试只会让 format_response 和测试一起错、互相印证。
 GOOD_PLAN = json.dumps(
     {
-        "days": [{"day": 1, "attractions": [{"name": "栈桥"}, {"name": "八大关"}]}],
+        "days": [{"day": 1, "activities": [
+            {"time": "09:00-10:30", "activity": "游览栈桥", "description": "", "cost": 0},
+            {"time": "11:00-12:00", "activity": "八大关散步", "description": "", "cost": 0},
+        ]}],
         "tips": ["海边风大，带件外套"],
     },
     ensure_ascii=False,

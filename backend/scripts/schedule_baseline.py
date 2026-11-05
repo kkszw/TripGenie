@@ -134,7 +134,9 @@ async def load_samples(db_path):
             if not tuple_:
                 continue
             values = tuple_.checkpoint.get("channel_values", {})
-            plan = values.get("final_plan") or values.get("draft_plan")
+            # 旧 checkpoint 里可能还有 final_plan（已废弃字段，从没有节点写过它），
+            # 一并兼容，免得跑历史数据时全部取到 None。
+            plan = values.get("draft_plan") or values.get("final_plan")
             if not plan:
                 continue
 
