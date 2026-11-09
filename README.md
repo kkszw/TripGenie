@@ -422,8 +422,6 @@ python scripts/build_corpus.py stats                         # 看语料概况
 >
 > 重建后需要重启服务：检索进程缓存了库里的目的地列表，不重启会用旧的过滤条件。
 
-`app/rag/init_rag_database.py` 是 Markdown 语料的旧入口，仍可用，但跑它会把公共库重建成「只有 `travel_guide/` 下那几份 md」的状态。
-
 ### 5. 启动前端
 
 ```bash

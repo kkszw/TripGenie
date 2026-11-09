@@ -143,9 +143,9 @@ def count_documents(where: Dict, scope: str = "public") -> int:
 def reset_collection(scope: str = "public") -> None:
     """清空一个 collection 并重建，不动另一个库。
 
-    为什么不照搬 init_rag_database 的 `shutil.rmtree(chroma_db_path)`：
-    那个路径下同时放着 public 和 user 两个 collection，整个目录删掉会把
-    用户上传的资料一起抹掉。重建公共语料不该有这种副作用。
+    为什么不直接 `shutil.rmtree(chroma_db_path)`：那个路径下同时放着
+    public 和 user 两个 collection，整个目录删掉会把用户上传的资料一起
+    抹掉。重建公共语料不该有这种副作用。
 
     删除之后必须把缓存里的 store 扔掉，否则 get_vector_store 拿到的还是
     指向已删除 collection 的旧对象，下一次写入会报
