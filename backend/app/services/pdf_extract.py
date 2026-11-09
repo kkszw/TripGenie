@@ -1,7 +1,8 @@
 # author: szw
 """PDF 文本抽取 —— 全项目唯一入口。
 
-为什么不用 document_loader 里那三个旧实现：
+`document_loader` 里原先那四个 PDF 加载实现已经删除，弃用原因记在这里，
+避免以后又照着写一遍：
   1. `load_and_split_pdf` 用 PyPDFLoader + 500/50 固定窗口，中文旅游攻略按 500 字切
      会把「第三天」的行程拦腰截断，检索「第三天」时命中半段；
   2. `load_pdf_advanced` 走 pypdf 的 extract_text，对多栏/表格排版会把行序打乱；
