@@ -11,6 +11,7 @@
 跑法：
     cd backend && python -m unittest tests.test_node_degrade -v
 """
+import asyncio
 import json
 import os
 import sys
@@ -19,7 +20,11 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from langchain_core.messages import AIMessage, ToolMessage  # noqa: E402
+
+from app.config import settings  # noqa: E402
 from app.core import llm as llm_runtime  # noqa: E402
+from app.core.nodes.chat import tool_node  # noqa: E402
 from app.core.nodes.plan import generate_plan_node  # noqa: E402
 from app.core.nodes.slots import format_input  # noqa: E402
 
@@ -171,6 +176,36 @@ class FormatInputDegradeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out["destination"], "青岛")
         self.assertEqual(out["days"], 4)
         self.assertEqual(out["current_step"], "format_input")
+
+
+class _SlowTool:
+    """永不返回的工具：MCP 响应丢失时的等价物。"""
+
+    async def ainvoke(self, args):
+        await asyncio.sleep(30)
+        return "永远到不了这里"
+
+
+class TestToolTimeout(unittest.IsolatedAsyncioTestCase):
+    """工具超时必须降级，不能中断整轮。"""
+
+    async def test_timeout_skips_tool_but_still_answers(self):
+        call = {"name": "slow_tool", "args": {"q": "x"}, "id": "call_1"}
+        state = {"messages": [AIMessage(content="", tool_calls=[call])]}
+
+        with mock.patch.object(llm_runtime, "tools_by_name",
+                               {"slow_tool": _SlowTool()}, create=True), \
+                mock.patch.object(llm_runtime, "llm",
+                                  _FakeLLM("实时数据没查到，先按经验说")), \
+                mock.patch.object(settings, "tool_timeout", 0.05):
+            out = await tool_node(state)
+
+        tool_msgs = [m for m in out["messages"] if isinstance(m, ToolMessage)]
+        self.assertEqual(len(tool_msgs), 1)
+        self.assertIn("超时", tool_msgs[0].content)
+        self.assertEqual(tool_msgs[0].tool_call_id, "call_1")
+        # 关键：超时只丢这一个工具的结果，用户仍要拿到正文
+        self.assertIn("先按经验说", out["response"])
 
 
 if __name__ == "__main__":

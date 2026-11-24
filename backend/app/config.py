@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     # 单次 LLM 调用的超时（秒），防止无响应时 SSE 一直挂着
     llm_timeout: int = int(os.getenv("LLM_TIMEOUT", "120"))
 
+    # 单个工具调用的超时（秒）。MCP 调用自身没有超时，响应丢了就永久挂起；
+    # 不设这层，一个工具卡住会把整条 SSE 拖到外层超时才结束。
+    tool_timeout: int = int(os.getenv("TOOL_TIMEOUT", "30"))
+
     # 注入模型的对话历史 token 预算，超出就丢最旧的消息（0 = 不限制）。
     # 按 token 而不是条数：50 条短问答只有几百 token，50 条带行程 JSON 的
     # 对话能到几万，条数完全约束不住成本，也挡不住超窗口。

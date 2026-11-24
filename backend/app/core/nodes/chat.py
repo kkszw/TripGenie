@@ -1,11 +1,13 @@
 # author: szw
 """闲聊分支：chat → tool_node 的工具调用循环。"""
+import asyncio
 from typing import Literal
 
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END
 
+from app.config import settings
 from app.core import llm as llm_runtime
 from app.core.logging import get_logger
 from app.core.state import TripState
@@ -81,21 +83,39 @@ async def tool_node(state: TripState):
             ))
             continue
 
+        timeout = settings.tool_timeout
         try:
             # 执行工具
             if hasattr(tool, 'ainvoke'):
                 logger.debug("工具参数", extra={"tool": tool_call["name"],
                                              "arguments": tool_call["args"]})
-                result = await tool.ainvoke(tool_call["args"])
+                result = await asyncio.wait_for(
+                    tool.ainvoke(tool_call["args"]), timeout=timeout
+                )
             else:
                 logger.debug("工具参数", extra={"tool": tool_call["name"],
                                              "arguments": tool_call["args"]})
-                result = tool.invoke(tool_call["args"])
+                # 同步工具丢进线程：直接在事件循环里调会把整个 loop 卡住，
+                # 连 SSE 都发不出去，超时也就无从触发。
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(tool.invoke, tool_call["args"]), timeout=timeout
+                )
 
             logger.debug("工具执行完成", extra={"tool": tool_call["name"]})
 
             results.append(ToolMessage(
                 content=str(result) if result else "执行完成",
+                tool_call_id=tool_call["id"]
+            ))
+
+        except asyncio.TimeoutError:
+            # 降级而不中断：少一个工具的结果，模型还能用其余信息作答；
+            # 整轮失败用户什么也拿不到。services/amap.py 的 geocode_mcp
+            # 只护住了地理编码一条路，这里护住工具节点上所有工具。
+            logger.warning("工具调用超时，本次跳过",
+                           extra={"tool": tool_call["name"], "timeout": timeout})
+            results.append(ToolMessage(
+                content=f"工具 {tool_call['name']} 超时（超过 {timeout} 秒），本次结果不可用",
                 tool_call_id=tool_call["id"]
             ))
 
