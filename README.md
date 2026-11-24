@@ -343,12 +343,7 @@ cp .env.example .env          # Windows: copy .env.example .env
 
 这份 `.env` 有两个消费者：后端进程读全部业务 Key，Compose 读两个 `VITE_` 变量当前端构建参数。
 
-> **根 `.env.example` 里没有 `VITE_` 变量**（它们原本只在前端那份样例里），走 Docker 方式必须手动补两行，否则构建出来的前端地图是空白：
->
-> ```dotenv
-> VITE_AMAP_JS_KEY=高德「Web端(JS API)」Key
-> VITE_AMAP_SECURITY_CODE=与之配对的 securityJsCode
-> ```
+> 两个 `VITE_` 变量在根 `.env.example` 末尾（`===== 前端地图（Vite 构建期变量）=====` 那一段），填 **Web端(JS API)** 类型的 Key。它们必须写在根 `.env` 而不是 `frontend/.env`：compose 的 build args 只从根 `.env` 插值，漏填的话前端能起来，但地图区域是一片空白。
 
 **② 构建**
 
