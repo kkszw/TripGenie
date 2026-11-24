@@ -3,16 +3,35 @@
 import asyncio
 from typing import Literal
 
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END
 
 from app.config import settings
 from app.core import llm as llm_runtime
 from app.core.logging import get_logger
+from app.core.prompts import CHAT_SYSTEM_PROMPT
 from app.core.state import TripState
 
 logger = get_logger(__name__)
+
+
+def _with_system(messages) -> list:
+    """把静态 system 拼在消息列表最前，仅用于本次调用。
+
+    为什么不写回 state：messages 通道带 add_messages reducer，返回 SystemMessage
+    会被逐轮累积成 N 份；而且它会被 api/chat.py 每轮的 RemoveMessage 清掉，
+    再占掉 get_context_messages 的历史 token 预算——花预算存一份永远不变的常量。
+
+    为什么不在这里拼日期/用户/槽位：这段是缓存前缀的开头。DeepSeek 按前缀匹配
+    缓存，前缀里只要有一个随请求变化的字符，后面的历史全部无法命中（命中与
+    未命中的输入价差 50 倍，见 core/metrics.py 的计价）。要变的信息走历史消息。
+
+    已经带 system 的输入不重复加：调用方可能已经拼好（test 与未来的复用方）。
+    """
+    if messages and isinstance(messages[0], SystemMessage):
+        return list(messages)
+    return [SystemMessage(content=CHAT_SYSTEM_PROMPT)] + list(messages)
 
 
 async def chat(state: TripState, config: RunnableConfig = None):
@@ -33,7 +52,9 @@ async def chat(state: TripState, config: RunnableConfig = None):
         "configurable": {"thread_id": state.get("thread_id")},
         "tags": ["user_visible"],
     }
-    async for chunk in llm_runtime.model_with_tools.astream(messages, config=config):
+    async for chunk in llm_runtime.model_with_tools.astream(
+        _with_system(messages), config=config
+    ):
 
         if full_response is None:
             full_response = chunk
@@ -133,8 +154,11 @@ async def tool_node(state: TripState):
     try:
         # 调用 LLM 生成最终回复（不带工具）。这条是用户真正看到的正文，
         # 同样要打 user_visible——否则走工具的那一轮，最终回复会被 chat.py 过滤掉。
+        # 这里必须同样带 system。走工具的这一轮，用户看到的正文来自这一次调用，
+        # 而不是 chat 那次——chat 那次只产出了 tool_calls。少了它，约束等于只作用在
+        # "决定调哪个工具"上，真正落笔的那一步反而没人管。
         final_response = await llm_runtime.llm.ainvoke(
-            all_messages, config={"tags": ["user_visible"]}
+            _with_system(all_messages), config={"tags": ["user_visible"]}
         )
         final_content = final_response.content if hasattr(final_response, 'content') else str(final_response)
 
