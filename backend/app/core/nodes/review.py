@@ -152,7 +152,7 @@ def parse_violations(data: Dict) -> Tuple[List[str], bool, str, List[str]]:
 
     if conflicts:
         # 约束本身打架：报出来的 violations 多半是这个矛盾的副产品，
-        # 一起丢掉，否则会重排一次仍然不过，白烧一轮 token 和十几秒。
+        # 一起丢掉，否则会重排一次仍然不过。
         return [], True, feedback, conflicts
 
     return issues, not issues, feedback, conflicts
@@ -199,8 +199,7 @@ async def review_plan_node(state: TripState, config: RunnableConfig = None) -> T
     days = state.get("draft_plan") or []
 
     if days:
-        # 第一层：算术能判的先判。有硬伤就直接重排，省掉这次 LLM 调用，
-        # 也避免模型在数字上"发挥"（它算错过总价，还把"未超预算"当违规报上来）。
+        # 第一层：算术能判的先判。有硬伤就直接重排，省掉这次 LLM 调用
         issues = code_review(state)
         if issues:
             feedback = "；".join(issues)

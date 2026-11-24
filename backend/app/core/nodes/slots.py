@@ -90,8 +90,7 @@ async def format_input(state: TripState, config: RunnableConfig = None) -> TripS
         data = parse_llm_json(content)
         modifying = str(data.get("task_type") or "").strip().lower() == "modify"
 
-        # 只覆盖本轮明确提到的值：用户这轮说"改成5天"时，destination 不能因为
-        # LLM 返回空串就把上一轮的三亚清掉。
+        # 只覆盖本轮明确提到的值：用户这轮说"改成5天"时，destination 不能因为LLM 返回空串就把上一轮的三亚清掉。
         new_dest = (data.get("destination") or "").strip()
         dest_explicit = bool(new_dest)
         state["destination"] = new_dest or known_dest

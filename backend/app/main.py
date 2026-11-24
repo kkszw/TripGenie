@@ -58,12 +58,10 @@ async def startup():
     app.state.checkpointer = await get_checkpointer()
 
     # 上一次进程退出时没跑完的入库任务：后台协程随进程一起没了，数据库里
-    # 那条记录还停在 parsing/indexing。不清理的话前端会对着一个永远不会
-    # 变化的状态无限轮询。
+    # 那条记录还停在 parsing/indexing。不清理的话前端会对着一个永远不会变化的状态无限轮询。
     db.reset_stale_knowledge_docs()
 
-    # 预热 MCP 工具清单：首次拉取要起两个 uvx 子进程（约 2s），
-    # 放到后台任务里做，不拖慢启动，也不让第一条消息承担这份开销。
+    # 预热 MCP 工具清单：首次拉取要起两个 uvx 子进程（约 2s），放到后台任务里做，不拖慢启动，也不让第一条消息承担这份开销。
     async def _warmup_tools():
         try:
             await ensure_tools()
@@ -74,8 +72,7 @@ async def startup():
     asyncio.create_task(_warmup_tools())
 
     # 预热 BM25 索引。首次要分词 4074 块（约 10 秒），放在启动后的后台线程里，
-    # 否则这份开销会落在第一个用户的第一次检索上——他会看到 10 秒的停顿，
-    # 而不是一条"正在检索"的进度提示。
+    # 否则这份开销会落在第一个用户的第一次检索上——他会看到 10 秒的停顿，而不是一条"正在检索"的进度提示。
     async def _warmup_bm25():
         if not settings.hybrid_search:
             return
@@ -88,8 +85,7 @@ async def startup():
 
     asyncio.create_task(_warmup_bm25())
 
-    # uvicorn 在启动时给自己的 logger 单独挂了 handler，摘掉才能让它的
-    # 启动/报错日志也走我们的格式（带 trace_id、同时落文件）
+    # uvicorn 在启动时给自己的 logger 单独挂了 handler，摘掉才能让它的启动/报错日志也走我们的格式（带 trace_id、同时落文件）
     adopt_uvicorn_loggers()
     logger.info("TripGenie API 启动完成")
 

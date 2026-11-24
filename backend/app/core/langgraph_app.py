@@ -96,8 +96,6 @@ async def create_workflow():
 async def get_workflow():
     """获取工作流（进程内单例）
 
-    原来 chat.py 每个请求都 await create_workflow() 重新编译一遍，而 main.py 启动时
-    编译好的那个 app.state.workflow 从来没人用。
     编译后的图是无状态的，状态由 thread_id 对应的 checkpoint 承载，
     多请求共用同一张图是安全的。
     """
