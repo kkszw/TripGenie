@@ -334,8 +334,9 @@ cd TripGenie
 pip install -r requirements.txt
 ```
 
-> ⚠️ `requirements.txt` 目前还是空文件（待冻结）。如果沿用你现有的虚拟环境，切到 DeepSeek 后需要补装对话模型适配包：
-> `pip install "langchain-openai>=0.2.0"`
+> `requirements.txt` 按模块分组写好依赖下限，每行注释标了实测版本，一条命令装完即可；`langchain-openai` 已在清单内，不需要单独补装。
+>
+> 想完全复现当时的版本，装完后再 `pip freeze > requirements.lock.txt` 锁一次——下限清单换个时间安装会解析到不同的小版本（例如 `onnxruntime` 是被 `rapidocr` 间接拉进来的，两次构建可能差好几个 minor）。
 
 ### 2. 配置环境变量
 
