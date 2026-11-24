@@ -1,8 +1,9 @@
 import asyncio
+import math
 import uuid
 import json
 from datetime import date
-from typing import Any, Dict, Optional
+from typing import Any, AsyncIterator, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.sse import EventSourceResponse
@@ -14,6 +15,7 @@ from app.core.langgraph_app import get_workflow
 from app.core.logging import bind_context, get_logger, new_trace_id
 from app.core.metrics import RunMetrics
 from app.core.prompts import build_slots_note
+from app.core.ratelimit import RateLimiter
 from app.core.security import get_current_user
 from app.core.state import TripState
 from app.models.chat import ChatRequest, ResumeRequest
@@ -21,6 +23,14 @@ from app.services.database import db
 
 router = APIRouter()
 logger = get_logger(__name__)
+
+# 进程内限流器。单 worker 部署下它就是全局计数器；改成多 worker/多副本时
+# 每个进程会各有一份预算，实际限额翻倍，那时必须换共享计数器（见 ratelimit.py）。
+rate_limiter = RateLimiter(
+    per_minute=settings.rate_limit_per_minute,
+    burst=settings.rate_limit_burst,
+    max_concurrent=settings.rate_limit_max_concurrent,
+)
 
 # 三个接口共用：Nginx 会缓冲响应，不关掉 SSE 就变成"最后一次性吐出来"
 _SSE_HEADERS = {
@@ -30,36 +40,92 @@ _SSE_HEADERS = {
 }
 
 
+def _acquire_slot(user_id: Any) -> None:
+    """占一个请求槽位；超限抛 429。
+
+    速率超限带 Retry-After（能算出还有多久补到 1 个令牌）；并发超限不带，
+    因为挡住它的是"上一条还没跑完"，结束时间不可预知。
+
+    选择 429 而不是排队等待：排队会让用户对着转圈干等，而且不知道要等多久；
+    429 + 明确的文案至少能把原因告诉前端。
+    """
+    allowed, retry_after, reason = rate_limiter.acquire(str(user_id))
+    if allowed:
+        return
+
+    if reason == "concurrent":
+        # 并发拒绝不给 Retry-After：挡住它的是"上一条还没跑完"，结束时间不可预知，
+        # 给个 1 秒反而会让前端自动重试再撞一次。让它按文案提示用户等。
+        detail = f"上一条回复还在生成，同时最多 {settings.rate_limit_max_concurrent} 条"
+        headers = {}
+    else:
+        # token 桶在 rate=0 的兜底分支会返回 inf，不能被 math.ceil 直接吃
+        seconds = max(1, math.ceil(retry_after)) if math.isfinite(retry_after) else 60
+        detail = f"发送太频繁，请 {seconds} 秒后再试"
+        headers = {"Retry-After": str(seconds)}
+
+    logger.warning("请求被限流", extra={"reason": reason, "detail": detail})
+    raise HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail=detail,
+        headers=headers or None,
+    )
+
+
+async def _with_slot(frames: AsyncIterator[str], user_id: Any) -> AsyncIterator[str]:
+    """把并发槽位的归还绑在流的生命周期上。
+
+    客户端断开时 Starlette 取消的是"消费这个生成器"的那一侧，生成器随之关闭，
+    finally 一定执行——正常结束、抛异常、断开三条出口都不会漏还。
+    漏还的后果不只是少算一次：该用户会被自己永远占住一个并发名额。
+    """
+    try:
+        async for frame in frames:
+            yield frame
+    finally:
+        rate_limiter.release(str(user_id))
+
+
 @router.post("/stream")
 async def send_chat(request: ChatRequest, current_user: Dict = Depends(get_current_user)):
     """发送聊天消息，使用 SSE 流式返回 Agent 响应。"""
     if not request.thread_id:
         request.thread_id = str(uuid.uuid4())
 
-    # messages.thread_id 上有外键约束，缺行时插入会触发 FOREIGN KEY constraint failed，
-    # 所以每条消息都要确保 sessions 里有对应行。
-    # 区别在于：会话已存在时必须校验归属，不能让 A 拿着 B 的 thread_id 往里写；
-    # 会话不存在才创建，归属当前登录用户（不再硬编码 "default"）。
+    # 校验在前、创建在后：归属校验是只读的，先做；建会话挪到限流之后，
+    # 否则一个被 429 拒掉的请求会在列表里留下一条没有任何消息的空会话。
     existing = db.get_session(request.thread_id)
-    if existing:
-        if existing.get("user_id") != current_user["id"]:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="无权访问该会话",
-            )
-    else:
-        db.create_session(request.thread_id, current_user["id"], "新对话")
+    if existing and existing.get("user_id") != current_user["id"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="无权访问该会话",
+        )
 
     # trace_id 在这里生成并绑到上下文：本次请求里的所有日志（含节点内部、
     # 高德调用、LLM 调用）都会自动带上它，排查时用 grep 一次捞全。
+    # 绑在限流之前，被拒的那次日志也能带上 trace_id。
     trace_id = new_trace_id()
     bind_context(trace_id=trace_id, thread_id=request.thread_id,
                  user_id=current_user["id"])
+
+    # 限流放在归属校验之后、日志之前：
+    # - 校验之后，是为了别人的 thread_id 被 403 拒掉时不消耗自己的令牌
+    # - 日志之前，是为了被限流的请求不打一条"收到消息"（没收到，没处理）
+    _acquire_slot(current_user["id"])
     logger.info("收到消息", extra={"chars": len(request.message or "")})
 
+    if not existing:
+        # messages.thread_id 上有外键约束，缺行时插消息会触发
+        # FOREIGN KEY constraint failed，所以每条消息进来前都要确保 sessions
+        # 有对应行；归属记在当前登录用户名下（不再硬编码 "default"）。
+        db.create_session(request.thread_id, current_user["id"], "新对话")
+
     return EventSourceResponse(
-        generate_sse_input(request.thread_id, request.message or "", trace_id,
-                           current_user["id"]),
+        _with_slot(
+            generate_sse_input(request.thread_id, request.message or "", trace_id,
+                               current_user["id"]),
+            current_user["id"],
+        ),
         headers=_SSE_HEADERS,
     )
 
@@ -89,11 +155,18 @@ async def resume_chat(request: ResumeRequest, current_user: Dict = Depends(get_c
     trace_id = new_trace_id()
     bind_context(trace_id=trace_id, thread_id=request.thread_id,
                  user_id=current_user["id"])
+
+    # 恢复也是一次完整的图运行（replan 要重新调 LLM 和工具），同样计入配额。
+    # 放在 409 之后：没有待确认的东西时不算一次请求。
+    _acquire_slot(current_user["id"])
     logger.info("恢复中断", extra={"payload": request.payload or {}})
 
     return EventSourceResponse(
-        generate_sse_resume(request.thread_id, request.payload or {}, trace_id,
-                            current_user["id"]),
+        _with_slot(
+            generate_sse_resume(request.thread_id, request.payload or {}, trace_id,
+                                current_user["id"]),
+            current_user["id"],
+        ),
         headers=_SSE_HEADERS,
     )
 

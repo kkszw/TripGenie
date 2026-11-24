@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     # 历史有上限，资料这一路完全敞开。超出按整篇从尾部截（尾部相关性最低）。
     rag_context_max_tokens: int = int(os.getenv("RAG_CONTEXT_MAX_TOKENS", "3000"))
 
+    # ===== 请求级限流 =====
+    # 三个都为 0 时关闭限流。默认值按"一个人正常聊天"给：
+    # 稳态 10 条/分钟、允许一次连发 3 条、同时最多 2 条流在跑。
+    # 一次规划要跑几十秒，并发上限比速率更能挡住"连点发送"。
+    rate_limit_per_minute: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", "10"))
+    rate_limit_burst: int = int(os.getenv("RATE_LIMIT_BURST", "3"))
+    rate_limit_max_concurrent: int = int(os.getenv("RATE_LIMIT_MAX_CONCURRENT", "2"))
+
     # ===== 向量化：百炼 text-embedding-v4（OpenAI 兼容模式）=====
     embedding_api_key: str = os.getenv("EMBEDDING_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
     embedding_base_url: str = os.getenv(
