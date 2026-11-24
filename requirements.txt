@@ -42,6 +42,11 @@ bcrypt>=4.1.0
 pypdf>=4.2.0
 typing-extensions>=4.12.0
 
+# ===== 中文分词（BM25 关键词检索）=====
+# rag/keyword_index.py 的 tokenize() 用 jieba.lcut 切词，是混合检索的必走路径。
+# 之前漏写在这里，靠环境里预先装过才没报错；干净环境会 ModuleNotFoundError。
+jieba>=0.42.1
+
 # ===== 用户资料上传（PDF 入库）=====
 # python-multipart：FastAPI 的 UploadFile 依赖它，缺了直接 500
 python-multipart>=0.0.9

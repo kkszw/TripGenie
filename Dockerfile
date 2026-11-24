@@ -1,4 +1,4 @@
-FROM docker.m.daocloud.io/library/python:3.11-slim
+FROM docker.m.daocloud.io/library/python:3.13-slim
 LABEL authors="sunzw"
 
 ENV PYTHONUNBUFFERED=1 \
@@ -22,8 +22,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && echo $TZ > /etc/timezone \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt /app/requirements.txt
-RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/requirements.txt \
+# 用 lock 而不是 requirements.txt：后者的依赖全是 >= 下限，构建时永远解析成
+# "构建那一刻的最新版"，和本机 conda 环境（实测版本）对不上。
+# lock 是把 conda 环境的版本裁到本项目可达范围后固化的，装出来逐字一致。
+COPY requirements.lock.txt /app/requirements.lock.txt
+RUN pip install -i https://pypi.tuna.tsinghua.edu.cn/simple -r /app/requirements.lock.txt \
     && pip install -i https://pypi.tuna.tsinghua.edu.cn/simple uv
 
 ENV UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple \
