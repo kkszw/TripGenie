@@ -287,8 +287,6 @@ async def _run_stream(thread_id: str,
             messages = _build_messages(history_messages, slots_note, user_message or "")
             if slots_note:
                 logger.debug("注入会话状态", extra={"note": slots_note})
-            db.add_message(thread_id, "user", user_message or "")
-            logger.debug("用户消息已入库", extra={"history": len(history_messages)})
 
             graph_input = TripState(
                 user_input=user_message or "",
