@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     # 对话能到几万，条数完全约束不住成本，也挡不住超窗口。
     chat_history_max_tokens: int = int(os.getenv("CHAT_HISTORY_MAX_TOKENS", "6000"))
 
+    # 单次检索拼进 prompt 的资料 token 上限（0 = 不限制）。
+    # 攻略检索和景点检索各调一次 retrieve_context，实测各 5 篇约 3900 token，
+    # 两个节点合计能到 7800——它和对话历史是两份互不相干的预算，以前只有
+    # 历史有上限，资料这一路完全敞开。超出按整篇从尾部截（尾部相关性最低）。
+    rag_context_max_tokens: int = int(os.getenv("RAG_CONTEXT_MAX_TOKENS", "3000"))
+
     # ===== 向量化：百炼 text-embedding-v4（OpenAI 兼容模式）=====
     embedding_api_key: str = os.getenv("EMBEDDING_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
     embedding_base_url: str = os.getenv(

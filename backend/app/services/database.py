@@ -8,26 +8,15 @@ from typing import List, Optional, Dict
 from app.config import settings
 from app.core.logging import get_logger
 from app.utils.path_tool import get_absolute_path
+# estimate_tokens 已挪到 utils/token_tool.py：检索侧也要用它设上下文预算，
+# 而本模块末尾有 db 单例，import 即建库。这里重新导出，旧的 import 路径继续可用。
+from app.utils.token_tool import estimate_tokens  # noqa: F401
 
 logger = get_logger(__name__)
 
 
 # ==================== 上下文长度控制 ====================
-# 对话历史按 token 预算截断，不是按条数。
-#
-# 为什么不引 tiktoken：它是 OpenAI 的分词器，对国内模型的中文切分不准
-# （rag/embeddings.py 里有同样的说明），而且只为估个数就多装一个带词表的
-# 二进制包不划算。这里按字符类别粗估：中文 1 字 1 token（偏保守，实际
-# 约 0.6~1），其余 4 字符 1 token（英文经验值）。估多了只是少带几句旧话，
-# 估少了才会超窗口，所以宁可高估。
-
-def estimate_tokens(text: str) -> int:
-    """粗估一段文本的 token 数（偏保守）。"""
-    if not text:
-        return 0
-    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
-    return cjk + (len(text) - cjk + 3) // 4
-
+# 对话历史按 token 预算截断，不是按条数。估算规则见 utils/token_tool.py。
 
 def trim_to_token_budget(messages: List[Dict], max_tokens: int) -> List[Dict]:
     """从最新一条往前收，直到预算用完，返回时间正序的那一段。

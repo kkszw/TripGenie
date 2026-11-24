@@ -8,6 +8,7 @@ import asyncio
 
 from langchain_core.runnables import RunnableConfig
 
+from app.config import settings
 from app.core import llm as llm_runtime
 from app.core.logging import get_logger
 from app.core.state import TripState
@@ -44,7 +45,8 @@ async def retrieve_guides(state: TripState, config: RunnableConfig = None):
         # 「交通」「有问必答」这些章节措辞逐字相同，不过滤就会拿回外地的段落。
         ctx = await asyncio.to_thread(
             retrieve_context, query, top_k=5, user_id=state.get("user_id"),
-            destination=state.get("destination"))
+            destination=state.get("destination"),
+            max_tokens=settings.rag_context_max_tokens)
         if writer:
             writer({
                 "type": "node_end",
@@ -76,7 +78,8 @@ async def search_attractions_node(state: TripState, config: RunnableConfig = Non
             query += f"，喜好：{prefs}"
         ctx = await asyncio.to_thread(
             retrieve_context, query, top_k=5, user_id=state.get("user_id"),
-            destination=state.get("destination"))
+            destination=state.get("destination"),
+            max_tokens=settings.rag_context_max_tokens)
         if writer:
             writer({
                 "type": "node_end",
