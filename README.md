@@ -368,7 +368,20 @@ docker compose logs -f backend     # 跟着看启动日志，Ctrl+C 只退出日
 | `http://localhost:8080` | 前端（nginx），`/api` 反向代理到后端 |
 | `http://localhost:8000/docs` | 接口文档。8000 只为调试暴露，正常访问走 8080 |
 
-**不需要再初始化向量库**：`chroma_db`、`corpus`、BM25 索引缓存都随镜像进容器，命名卷首次创建时用镜像里的内容填充。
+**向量库会不会跟着镜像走，取决于构建机。** `.gitignore` 第 51–55 行忽略了 `backend/app/data/` 下的 `chroma_db/`、`cache/`、`checkpoints/`、`uploads/`，只有 125 份语料 JSON 进了仓库。而 `Dockerfile` 的 `COPY backend ./backend` 拷的是**构建机上的实际目录**，不看 git：
+
+| 情况 | 镜像里有没有向量库 | 首次启动后 |
+|---|---|---|
+| 在开发过、本地已有 `chroma_db` 的副本上构建 | 有（约 158MB 随 `COPY backend` 进镜像） | 直接可用，无需任何初始化 |
+| `git clone` 到干净目录后构建 | **没有** | 跑一次下面的重建命令 |
+
+```bash
+docker compose exec backend python scripts/build_corpus.py index --rebuild   # 约 2 分钟，要 DASHSCOPE_API_KEY
+```
+
+`build_corpus.py` 的 `ROOT` 取脚本上两级，在容器里（`WORKDIR /app/backend`）正好落在卷 `/app/backend/app/data` 上，重建结果会写进 `tripgenie-data` 卷，`down` / `up` 都不会丢。
+
+命名卷第一次创建时用镜像里该目录的内容初始化，之后不再重新灌。
 
 **数据与日志在命名卷里**，`docker compose down` 不会丢：
 
