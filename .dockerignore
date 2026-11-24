@@ -1,0 +1,12 @@
+.git
+../.gitignore
+.env
+.env.*
+docs
+.workbuddy
+frontend
+**/__pycache__
+**/*.pyc
+**/*.pyo
+backend/logs
+*.md
