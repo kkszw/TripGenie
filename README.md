@@ -32,7 +32,8 @@
 
 入口节点用 LLM 的**结构化输出**（`with_structured_output` + `Literal["chat", "format_input"]`）判断用户意图，再由条件边路由，而不是靠关键词匹配堆 if-else。
 
-- **chat 分支**：闲聊或单一工具诉求（天气、景点、交通、美食）。走标准 ReAct 循环——模型自主决定调用哪些工具，工具结果回灌后再由模型汇总成自然语言回复，单轮支持多工具并发调用。
+- **chat 分支**：闲聊或单一工具诉求（天气、景点、交通、美食）。走**单轮 Function Calling**——模型返回一组 `tool_calls` 后由条件边路由到 `tool_node`，逐个执行，再把工具结果连同历史消息交给模型做一次汇总，生成用户看到的那段正文；随后直接 `END`，不回到决策节点。
+  所以这里**没有**「调用 → 观察 → 再决策」的多轮 ReAct 回环。取舍：工具全是**查询型**（查天气、查景点、查路线），一轮拿到的数据对单一诉求已经够用，多跑一轮只会把延迟翻倍、上下文成本按轮线性叠高，还容易陷入「反复调工具不收敛」。多个工具时逐个执行而非并发，是因为高德个人 Key 的 QPS 很低，并发会直接撞 `10021` 限流（见下方 `MAP_CONCURRENCY`）。
 - **format_input 分支**：多天行程规划这类复杂任务，进入下方的规划链路。
 
 ### 2. 行程规划：并行检索 + 汇聚生成
@@ -231,7 +232,7 @@ python scripts/build_corpus.py index --skip-existing          # 中断后接着�
 flowchart TD
     START([用户输入]) --> classify["classify_input<br/>意图分类（结构化输出）"]
 
-    classify -->|chat| chat["chat<br/>ReAct 对话"]
+    classify -->|chat| chat["chat<br/>Function Calling"]
     chat --> should{"有工具调用?"}
     should -->|是| tool["tool_node<br/>执行工具并汇总"]
     should -->|否| E1([结束])
@@ -263,12 +264,16 @@ flowchart TD
 | 存储 | SQLite（业务库 + LangGraph 检查点） |
 | 前端 | Vue 3（Composition API）、Vite、原生 ReadableStream 解析 SSE、高德地图 JS API |
 | 外部服务 | 高德地图开放平台、天气 API |
+| 部署 | Docker Compose：后端 `python:3.13-slim`，前端 `node:22-alpine` 构建 → `nginx:alpine` 运行时（多阶段）；依赖按 `requirements.lock.txt` 锁定 |
 
 ### 目录结构
 
 ```
 TripGenie/
+├── Dockerfile                       # 后端镜像：依赖按 lock 装 + 构建期预热 MCP 环境
+├── docker-compose.yml               # 前后端编排、命名卷、端口映射
 ├── requirements.txt
+├── requirements.lock.txt            # 131 个包的精确版本，镜像按它安装
 ├── .env.example
 ├── backend/
 │   ├── run.py                       # 启动入口（uvicorn）
@@ -300,6 +305,8 @@ TripGenie/
 │       ├── models/                   # 请求 / 响应模型
 │       └── data/                     # 语料（corpus JSON / Markdown）、向量库、城市编码表、会话数据库
 └── frontend/
+    ├── Dockerfile                   # 多阶段：node 构建 → nginx 托管静态产物
+    ├── nginx.conf                   # history 回退 + /api 反代 + SSE 不缓冲
     ├── index.html
     ├── vite.config.js               # 含 /api 反向代理
     └── src/
@@ -315,7 +322,85 @@ TripGenie/
 
 ## 快速开始
 
-### 环境要求
+两条路，按目的选：只想跑起来看效果走**方式一**，要改代码走**方式二**。两种方式用的是同一批 Key，清单见「方式二 · 环境要求」。
+
+### 方式一：Docker Compose（推荐）
+
+前后端各一个镜像，一条命令起全套，本机不需要装 Python / Node / uvx。后端从 `python:3.13-slim` 起，前端由 `node:22-alpine` 构建后交给 `nginx:alpine` 托管。
+
+**前置**：Docker Desktop（Windows / macOS），或 Docker Engine + Compose V2（Linux）。`docker version` 能看到 `Server:` 段即可。
+
+```bash
+git clone https://github.com/kkszw/TripGenie.git
+cd TripGenie
+```
+
+**① 环境变量：只配仓库根目录这一份**
+
+```bash
+cp .env.example .env          # Windows: copy .env.example .env
+```
+
+这份 `.env` 有两个消费者：后端进程读全部业务 Key，Compose 读两个 `VITE_` 变量当前端构建参数。
+
+> **根 `.env.example` 里没有 `VITE_` 变量**（它们原本只在前端那份样例里），走 Docker 方式必须手动补两行，否则构建出来的前端地图是空白：
+>
+> ```dotenv
+> VITE_AMAP_JS_KEY=高德「Web端(JS API)」Key
+> VITE_AMAP_SECURITY_CODE=与之配对的 securityJsCode
+> ```
+
+**② 构建**
+
+```bash
+docker compose build --progress plain
+```
+
+首次约 10 分钟：131 个 Python 包、构建期用 `uvx` 把两个 MCP Server 的隔离环境装好（这样运行期起工具才是秒级）、前端 `npm install` + `vite build`。之后只改代码，重建只走最后一层。
+
+**③ 启动**
+
+```bash
+docker compose up -d
+docker compose ps                  # 等到 backend 显示 (healthy)，约 40 秒
+docker compose logs -f backend     # 跟着看启动日志，Ctrl+C 只退出日志不停止容器
+```
+
+**④ 访问**
+
+| 地址 | 内容 |
+|---|---|
+| `http://localhost:8080` | 前端（nginx），`/api` 反向代理到后端 |
+| `http://localhost:8000/docs` | 接口文档。8000 只为调试暴露，正常访问走 8080 |
+
+**不需要再初始化向量库**：`chroma_db`、`corpus`、BM25 索引缓存都随镜像进容器，命名卷首次创建时用镜像里的内容填充。
+
+**数据与日志在命名卷里**，`docker compose down` 不会丢：
+
+| 卷 | 容器内路径 | 内容 |
+|---|---|---|
+| `tripgenie-data` | `/app/backend/app/data` | 向量库、语料、会话 SQLite、上传资料 |
+| `tripgenie-logs` | `/app/backend/logs` | 结构化日志、`runs.jsonl` |
+
+**常用命令**
+
+```bash
+docker compose stop                 # 暂停，容器保留，start 秒回
+docker compose up -d                # 继续
+docker compose down                 # 收工：删容器和网络，卷保留
+docker compose down -v              # 连卷一起删（会话历史、上传资料全没）
+docker compose exec backend bash    # 进容器排查
+docker compose logs -f --tail 100 backend
+```
+
+**两个容易忽略的点**
+
+- **换地图 Key 必须重建前端**。`VITE_*` 是 Vite 在构建期烧进产物的，运行期加 `-e` 改无效 → `docker compose build frontend && docker compose up -d`。
+- **改依赖要同步 lock**。`Dockerfile` 装的是 `requirements.lock.txt` 而不是 `requirements.txt`，只改后者容器里的版本不会变。
+
+### 方式二：本地开发
+
+#### 环境要求
 
 - **Python >= 3.12**
 - **Node.js >= 18**
@@ -326,7 +411,7 @@ TripGenie/
   - **Web 端（JS API）** Key —— 前端渲染地图用，记得把 `localhost` 加进域名白名单
   - **Web 服务** Key —— 后端透传给 MCP，用于地理编码和路径规划
 
-### 1. 安装后端依赖
+#### 1. 安装后端依赖
 
 ```bash
 git clone https://github.com/kkszw/TripGenie.git
@@ -336,9 +421,11 @@ pip install -r requirements.txt
 
 > `requirements.txt` 按模块分组写好依赖下限，每行注释标了实测版本，一条命令装完即可；`langchain-openai` 已在清单内，不需要单独补装。
 >
-> 想完全复现当时的版本，装完后再 `pip freeze > requirements.lock.txt` 锁一次——下限清单换个时间安装会解析到不同的小版本（例如 `onnxruntime` 是被 `rapidocr` 间接拉进来的，两次构建可能差好几个 minor）。
+> 想逐字复现当时的版本，直接装仓库里的 `requirements.lock.txt`（131 个包，`Dockerfile` 装的也是这一份）：`pip install -r requirements.lock.txt`。下限清单换个时间安装会解析到不同的小版本——`onnxruntime` 就是被 `rapidocr` 间接拉进来的，两次构建可能差好几个 minor。
+>
+> lock 只保证「包在、版本对」，不保证互相兼容：`pip` 升级时不会回溯校验已装包的约束。改完 lock 建议补跑 `pip install --dry-run -r requirements.lock.txt` 和 `pip check`。
 
-### 2. 配置环境变量
+#### 2. 配置环境变量
 
 ```bash
 cp .env.example .env          # Windows: copy .env.example .env
@@ -387,7 +474,7 @@ cp .env.example .env
 
 > 两者类型不通用：`AMAP_API_KEY`（后端，Web 服务）不能用于浏览器；`VITE_AMAP_JS_KEY`（Web端 JS API）不能用于后端接口。地图脚本由 `src/utils/amap.js` 动态加载，加载失败会在卡片里直接显示原因，不再只留一个灰块。
 
-### 3. 启动后端
+#### 3. 启动后端
 
 ```bash
 cd backend
@@ -398,7 +485,7 @@ python run.py
 
 > 向量库与会话数据库统一放在 `backend/app/data/` 下，路径相对 `backend/app/` 解析，从哪个目录启动都指向同一份数据。
 
-### 4. 初始化 RAG 向量库（首次运行必须）
+#### 4. 初始化 RAG 向量库（首次运行必须）
 
 内置语料是 125 份 PDF 攻略，分两步构建。**抽取产物已经提交在仓库里**，所以正常安装只需要跑第二步（嵌入）：
 
@@ -423,7 +510,7 @@ python scripts/build_corpus.py stats                         # 看语料概况
 >
 > 重建后需要重启服务：检索进程缓存了库里的目的地列表，不重启会用旧的过滤条件。
 
-### 5. 启动前端
+#### 5. 启动前端
 
 ```bash
 cd frontend
