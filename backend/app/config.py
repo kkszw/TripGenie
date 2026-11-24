@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     # 单次 LLM 调用的超时（秒），防止无响应时 SSE 一直挂着
     llm_timeout: int = int(os.getenv("LLM_TIMEOUT", "120"))
 
+    # 注入模型的对话历史 token 预算，超出就丢最旧的消息（0 = 不限制）。
+    # 按 token 而不是条数：50 条短问答只有几百 token，50 条带行程 JSON 的
+    # 对话能到几万，条数完全约束不住成本，也挡不住超窗口。
+    chat_history_max_tokens: int = int(os.getenv("CHAT_HISTORY_MAX_TOKENS", "6000"))
+
     # ===== 向量化：百炼 text-embedding-v4（OpenAI 兼容模式）=====
     embedding_api_key: str = os.getenv("EMBEDDING_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
     embedding_base_url: str = os.getenv(

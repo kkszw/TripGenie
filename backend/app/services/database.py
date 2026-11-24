@@ -12,6 +12,64 @@ from app.utils.path_tool import get_absolute_path
 logger = get_logger(__name__)
 
 
+# ==================== 上下文长度控制 ====================
+# 对话历史按 token 预算截断，不是按条数。
+#
+# 为什么不引 tiktoken：它是 OpenAI 的分词器，对国内模型的中文切分不准
+# （rag/embeddings.py 里有同样的说明），而且只为估个数就多装一个带词表的
+# 二进制包不划算。这里按字符类别粗估：中文 1 字 1 token（偏保守，实际
+# 约 0.6~1），其余 4 字符 1 token（英文经验值）。估多了只是少带几句旧话，
+# 估少了才会超窗口，所以宁可高估。
+
+def estimate_tokens(text: str) -> int:
+    """粗估一段文本的 token 数（偏保守）。"""
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    return cjk + (len(text) - cjk + 3) // 4
+
+
+def trim_to_token_budget(messages: List[Dict], max_tokens: int) -> List[Dict]:
+    """从最新一条往前收，直到预算用完，返回时间正序的那一段。
+
+    两条边界规则：
+
+    1. **至少留一条**。单条就超预算时（例如一整份行程 JSON）也收下——
+       空历史比"只有一句超长回复"更糟，模型会完全不知道上一轮说过什么；
+    2. **补回被截断的提问**。截断点可能正好落在一问一答之间，只留一条
+       assistant 回复会让模型看到"没有问题的答案"，所以把它前面的 user
+       一起带回来。
+
+    max_tokens <= 0 表示不限制（与 MAP_POLYLINE_TOLERANCE_M=0 关闭抽稀
+    的约定一致）。
+    """
+    if not messages:
+        return []
+    if max_tokens <= 0:
+        return list(messages)
+
+    picked: List[Dict] = []
+    used = 0
+    for msg in reversed(messages):
+        cost = estimate_tokens(msg.get("content") or "")
+        if picked and used + cost > max_tokens:
+            break
+        picked.append(msg)
+        used += cost
+
+    picked.reverse()
+
+    # picked 一定是 messages 的连续后缀，所以起点用长度差算，不靠 index 查值
+    # （两条内容完全相同的消息会让 index 找错位置）。
+    if picked and picked[0].get("role") == "assistant":
+        start = len(messages) - len(picked)
+        if start > 0:
+            picked.insert(0, messages[start - 1])
+
+    return picked
+
+
+
 class DatabaseService:
     """数据库服务 - 管理会话和消息"""
 
@@ -373,6 +431,21 @@ class DatabaseService:
         conn.close()
 
         return [dict(row) for row in rows]
+
+    def get_context_messages(self, thread_id: str, max_tokens: int = 6000,
+                             scan_limit: int = 500) -> List[Dict]:
+        """取注入模型的历史消息：最近的一段，按 token 预算截断（时间正序）。
+
+        为什么不再用「最近 50 条」：条数和成本无关。50 条短问答可能只有几百
+        token，50 条带行程 JSON 的对话能到几万——单次请求的输入成本差两个数量
+        级，上下文窗口也可能被顶爆。
+
+        scan_limit 只是内存保护：长会话可能有上千条消息，先按条数粗筛一遍，
+        再在候选里按 token 精确截。500 条 × 平均 100~200 token，足够挑出
+        几千 token 的预算，不必把整张表读进内存。
+        """
+        recent = self.get_messages(thread_id, limit=scan_limit)
+        return trim_to_token_budget(recent, max_tokens)
 
     def get_last_messages(self, thread_id: str, limit: int = 10) -> List[Dict]:
         """获取最近的 N 条消息（用于上下文）"""

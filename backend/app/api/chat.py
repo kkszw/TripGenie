@@ -9,6 +9,7 @@ from fastapi.sse import EventSourceResponse
 from langchain_core.messages import HumanMessage, AIMessage, RemoveMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.types import Command
+from app.config import settings
 from app.core.langgraph_app import get_workflow
 from app.core.logging import bind_context, get_logger, new_trace_id
 from app.core.metrics import RunMetrics
@@ -227,8 +228,12 @@ async def _run_stream(thread_id: str,
             # 恢复：图从 checkpoint 里 pending 的那个节点继续
             graph_input = Command(resume=resume_payload)
         else:
-            # 获取历史消息
-            history_messages = db.get_messages(thread_id)
+            # 获取历史消息：按 token 预算截断，不再按「最近 50 条」。
+            # 条数约束不住成本——50 条短问答几百 token，50 条带行程 JSON
+            # 的对话能到几万，单次请求的输入费用差两个数量级。
+            history_messages = db.get_context_messages(
+                thread_id, max_tokens=settings.chat_history_max_tokens
+            )
             db.add_message(thread_id, "user", user_message or "")
             logger.debug("用户消息已入库", extra={"history": len(history_messages)})
 
