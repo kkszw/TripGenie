@@ -1,5 +1,5 @@
 import uuid
-from typing import Dict
+from typing import Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
@@ -75,10 +75,28 @@ async def get_history(current_user: Dict = Depends(get_current_user)):
 
 
 @router.get("/{thread_id}", tags=["会话"])
-async def get_session(thread_id: str, current_user: Dict = Depends(get_current_user)):
-    """获取单个会话的完整内容"""
+async def get_session(
+    thread_id: str,
+    limit: int = 50,
+    before: Optional[int] = None,
+    current_user: Dict = Depends(get_current_user),
+):
+    """获取单个会话的一页消息（时间正序）。
+
+    翻页方向是从最新往前：不带 `before` 拿最新一页，响应里的 `next_before`
+    用来取更早的一页。前端在列表顶部放一个「加载更早的消息」按钮。
+
+    为什么必须分页：这里原来是 `db.get_messages(thread_id)`，默认 limit=50，
+    超过 50 条的会话早期消息永远取不到，而且接口不告诉调用方被截断过——
+    用户看到的是"历史丢了"。现在把 `has_more` 显式交出去。
+    """
     session = _owned_session(thread_id, current_user)
-    messages = db.get_messages(thread_id)
+
+    # 上限 200：一次把几千条消息塞进响应，前端挂载和滚动都要卡。
+    # 下限 1：limit=0 会让 SQL 的 LIMIT 0 返回空页，看起来像"这个会话没消息"。
+    limit = max(1, min(int(limit), 200))
+    page = db.get_messages_page(thread_id, limit=limit, before_id=before)
+    messages = page["messages"]
 
     return {
         "id": session.get("thread_id"),
@@ -86,6 +104,9 @@ async def get_session(thread_id: str, current_user: Dict = Depends(get_current_u
         "created_at": session.get("created_at"),
         "updated_at": session.get("updated_at"),
         "messages": messages,
+        "has_more": page["has_more"],
+        # 下一页的游标 = 本页最早那条的 id。没有更早的就不给，前端少判一次。
+        "next_before": messages[0]["id"] if (page["has_more"] and messages) else None,
     }
 
 

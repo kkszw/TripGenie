@@ -72,6 +72,17 @@
           </div>
         </div>
 
+        <!-- 更早的消息：只在确实还有更早的页时出现，点了才去取 -->
+        <div v-if="hasOlderHistory" class="load-older">
+          <button
+              class="load-older-btn"
+              :disabled="isLoadingOlder"
+              @click="loadOlderHistory"
+          >
+            {{ isLoadingOlder ? '加载中…' : '加载更早的消息' }}
+          </button>
+        </div>
+
         <!-- 消息列表 -->
         <div v-for="(msg, index) in messages" :key="index" class="message-wrapper">
           <!-- AI 消息 -->
@@ -569,54 +580,72 @@ const scrollToBottom = () => {
 }
 
 // ===== 加载会话消息 =====
+// 一页 30 条：分页的意义是"打开会话不要一次拉全部"，条数太大就等于没分页。
+const HISTORY_PAGE_SIZE = 30
+const hasOlderHistory = ref(false)
+const olderCursor = ref(null)
+const isLoadingOlder = ref(false)
+
+// 一条库里的消息 → 界面消息对象
+const mapHistoryMessage = (msg, index) => {
+  const message = {
+    // 历史消息也要有身份：确认卡可能挂在这些消息上，点确认后要走
+    // aiMsgIndex 定位回它（否则写入会被 -1 挡掉，界面没反应）。
+    // 用库里的自增 id 而不是数组下标：分页之后会往前面插几十条，
+    // 下标生成的 id 会和已有消息撞，aiMsgIndex 就会定位到错的那条。
+    aiMsgId: msg.id ? `hist-${msg.id}` : `hist-${index}-${Date.now()}`,
+    role: msg.type === 'human' || msg.role === 'user' ? 'user' : 'assistant',
+    content: msg.content || '',
+    timestamp: msg.timestamp || new Date().toISOString(),
+    tripPlan: null
+  }
+
+  // 如果是 AI 消息
+  if (message.role === 'assistant') {
+    // 1. 从 content 解析行程
+    if (message.content) {
+      const plan = parseTripPlanFromMessage(message.content)
+      if (plan) {
+        message.tripPlan = plan
+      }
+    }
+
+    // ✅ 2. 如果数据库里存了 map_data，附加到 tripPlan 上
+    if (message.tripPlan && msg.map_data) {
+      try {
+        const mapData = typeof msg.map_data === 'string'
+          ? JSON.parse(msg.map_data)
+          : msg.map_data
+        message.tripPlan.map_data = mapData
+        console.log('✅ 附加 map_data:', mapData.attractions?.length || 0, '个景点')
+      } catch (e) {
+        console.warn('⚠️ 解析 map_data 失败:', e)
+      }
+    }
+  }
+
+  return message
+}
+
 const loadSessionMessagesFromDB = async (threadId) => {
   if (!threadId) return
-  try {
-    const msgs = await loadSessionMessages(threadId)
 
-    if (!msgs || msgs.length === 0) {
+  // 先归零：换会话时不能让上一个会话的"还有更早"漏到新的这个上
+  hasOlderHistory.value = false
+  olderCursor.value = null
+
+  try {
+    const page = await loadSessionMessages(threadId, {limit: HISTORY_PAGE_SIZE})
+
+    hasOlderHistory.value = page.hasMore
+    olderCursor.value = page.nextBefore
+
+    if (!page.messages.length) {
       messages.value = []
       return
     }
 
-    messages.value = msgs.map((msg, index) => {
-      // 基础消息对象
-      const message = {
-        // 历史消息也要有身份：确认卡可能挂在这些消息上，点确认后要走
-        // aiMsgIndex 定位回它（否则写入会被 -1 挡掉，界面没反应）
-        aiMsgId: `hist-${index}-${Date.now()}`,
-        role: msg.type === 'human' || msg.role === 'user' ? 'user' : 'assistant',
-        content: msg.content || '',
-        timestamp: msg.timestamp || new Date().toISOString(),
-        tripPlan: null
-      }
-
-      // 如果是 AI 消息
-      if (message.role === 'assistant') {
-        // 1. 从 content 解析行程
-        if (message.content) {
-          const plan = parseTripPlanFromMessage(message.content)
-          if (plan) {
-            message.tripPlan = plan
-          }
-        }
-
-        // ✅ 2. 如果数据库里存了 map_data，附加到 tripPlan 上
-        if (message.tripPlan && msg.map_data) {
-          try {
-            const mapData = typeof msg.map_data === 'string'
-              ? JSON.parse(msg.map_data)
-              : msg.map_data
-            message.tripPlan.map_data = mapData
-            console.log('✅ 附加 map_data:', mapData.attractions?.length || 0, '个景点')
-          } catch (e) {
-            console.warn('⚠️ 解析 map_data 失败:', e)
-          }
-        }
-      }
-
-      return message
-    })
+    messages.value = page.messages.map(mapHistoryMessage)
 
     // 日志统计
     const planCount = messages.value.filter(m => m.tripPlan).length
@@ -631,6 +660,47 @@ const loadSessionMessagesFromDB = async (threadId) => {
 
   } catch (error) {
     console.error('加载会话消息失败:', error)
+  }
+}
+
+// ===== 往前翻一页 =====
+// 点了才请求，打开会话时不预先加载——否则分页只剩"延迟加载"这一半。
+const loadOlderHistory = async () => {
+  const threadId = props.threadId || currentThreadId.value
+  if (!threadId || isLoadingOlder.value || !hasOlderHistory.value || !olderCursor.value) return
+
+  // 记下插入前的高度和滚动位置：往前插 30 条会把视野顶走，
+  // 用户点这个按钮想看的是紧接着上面那段，不是被传送到会话最顶端。
+  const wrapper = messagesWrapper.value
+  const prevHeight = wrapper ? wrapper.scrollHeight : 0
+  const prevTop = wrapper ? wrapper.scrollTop : 0
+
+  isLoadingOlder.value = true
+  try {
+    const page = await loadSessionMessages(threadId, {
+      limit: HISTORY_PAGE_SIZE,
+      before: olderCursor.value
+    })
+
+    if (!page.messages.length) {
+      // 后端说还有、实际取不到：把按钮收掉，别让用户反复点
+      hasOlderHistory.value = false
+      return
+    }
+
+    messages.value = [...page.messages.map(mapHistoryMessage), ...messages.value]
+    hasOlderHistory.value = page.hasMore
+    olderCursor.value = page.nextBefore
+
+    await nextTick()
+    if (wrapper) {
+      // 多出来的高度补进 scrollTop，视觉上停在原处
+      wrapper.scrollTop = wrapper.scrollHeight - prevHeight + prevTop
+    }
+  } catch (error) {
+    console.error('加载更早的消息失败:', error)
+  } finally {
+    isLoadingOlder.value = false
   }
 }
 
@@ -664,6 +734,9 @@ const attachPendingInterrupt = async (threadId) => {
 // ===== 清空消息 =====
 const clearMessages = () => {
   messages.value = []
+  // 分页状态跟着清：新会话没有"更早的消息"可翻，留着会让按钮错位出现
+  hasOlderHistory.value = false
+  olderCursor.value = null
 }
 
 // ===== 聚焦输入框 =====
@@ -1751,6 +1824,35 @@ onUnmounted(() => {
   max-width: 820px;
   margin: 0 auto;
   padding: 0 24px 150px;
+}
+
+/* 往前翻页的按钮：只在还有更早的消息时出现，视觉刻意放轻，不抢正文 */
+.load-older {
+  display: flex;
+  justify-content: center;
+  padding: 6px 0 18px;
+}
+
+.load-older-btn {
+  padding: 7px 18px;
+  font-size: 12.5px;
+  color: #5b6274;
+  background: #ffffff;
+  border: 1px solid #e8eaf1;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+
+.load-older-btn:hover:not(:disabled) {
+  color: #2f3b52;
+  border-color: #c7d2fe;
+  box-shadow: 0 6px 18px rgba(79, 110, 247, 0.1);
+}
+
+.load-older-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
 }
 
 /* ===== 右侧对话缩略表（常态为细刻度条，悬停展开） ===== */

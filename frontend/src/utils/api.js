@@ -198,10 +198,20 @@ export const api = {
     // ===== 消息管理 =====
 
     // 获取会话消息
-    getSessionMessages: async function (threadId) {
-        const response = await fetch(`${API_BASE}/api/history/${threadId}`, {
-            headers: authHeaders()
-        });
+    // 会话消息（分页）
+    // 不带 before 取最新一页；返回的 nextBefore 作为下一次的 before 往前翻。
+    // 原来这里固定返回最近 50 条、且不告诉调用方被截断过，长会话里
+    // 用户看到的就是"早期对话丢了"。现在把 hasMore 显式交出去。
+    getSessionMessages: async function (threadId, options = {}) {
+        const params = new URLSearchParams()
+        if (options.limit) params.set('limit', String(options.limit))
+        if (options.before) params.set('before', String(options.before))
+        const query = params.toString()
+
+        const response = await fetch(
+            `${API_BASE}/api/history/${threadId}${query ? `?${query}` : ''}`,
+            {headers: authHeaders()}
+        );
 
         if (!response.ok) {
             onUnauthorized(response);
@@ -209,7 +219,12 @@ export const api = {
         }
 
         const data = await response.json();
-        return data.messages || [];
+        return {
+            messages: data.messages || [],
+            hasMore: !!data.has_more,
+            // ?? 而不是 ||：id 从 1 开始，不会误判，但用 ?? 语义更准
+            nextBefore: data.next_before ?? null
+        };
     },
 
     // 发送消息（流式）

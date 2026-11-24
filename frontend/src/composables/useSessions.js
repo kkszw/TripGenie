@@ -101,13 +101,16 @@ const updateSessionTitle = async (threadId, name) => {
     }
 }
 
-// ===== 获取会话消息 =====
-const loadSessionMessages = async (threadId) => {
+// ===== 获取会话消息（分页） =====
+// 返回 {messages, hasMore, nextBefore}：调用方靠 hasMore 决定要不要显示
+// "加载更早的消息"，靠 nextBefore 往前翻。出错时给空页，不要返回数组——
+// 两种形状混着用，调用方迟早会漏判一次。
+const loadSessionMessages = async (threadId, options = {}) => {
     try {
-        return await api.getSessionMessages(threadId)
+        return await api.getSessionMessages(threadId, options)
     } catch (err) {
         console.error('❌ 加载消息失败:', err)
-        return []
+        return {messages: [], hasMore: false, nextBefore: null}
     }
 }
 

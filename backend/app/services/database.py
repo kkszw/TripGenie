@@ -62,9 +62,14 @@ def trim_to_token_budget(messages: List[Dict], max_tokens: int) -> List[Dict]:
 class DatabaseService:
     """数据库服务 - 管理会话和消息"""
 
-    def __init__(self):
-        # 路径相对 app/ 解析，与启动目录无关
-        self.db_path = Path(get_absolute_path(settings.checkpoint_db_path))
+    def __init__(self, db_path: Optional[str] = None):
+        # 路径相对 app/ 解析，与启动目录无关。
+        # db_path 只给测试用：分页这类"顺序 + 边界"的逻辑必须能在临时库上跑，
+        # 不能让它去碰真实的 sessions.db。
+        if db_path:
+            self.db_path = Path(db_path)
+        else:
+            self.db_path = Path(get_absolute_path(settings.checkpoint_db_path))
         self._init_db()
 
     def _get_connection(self):
@@ -420,6 +425,54 @@ class DatabaseService:
         conn.close()
 
         return [dict(row) for row in rows]
+
+    def get_messages_page(self, thread_id: str, limit: int = 50,
+                          before_id: Optional[int] = None) -> Dict:
+        """按游标取一页消息，返回时间正序的一段。
+
+        为什么用 id 游标而不是 offset：
+        - 聊天记录是只增的，翻页期间新消息只会追加在尾部，用 `id < before`
+          翻旧页不会错位；OFFSET 一旦有新消息进来，后一页会重复或漏掉。
+        - id 是自增主键，就是插入顺序，add_messages_batch 一批消息共用同一个
+          timestamp 时它也是唯一的先后依据（get_messages 里的排序同理）。
+
+        Args:
+            thread_id: 会话 ID
+            limit: 这一页最多几条（调用方负责上下限，这里只做个兜底）
+            before_id: 取 id 小于它的消息；None 表示取最新的一页
+
+        Returns:
+            {"messages": [...时间正序...], "has_more": 是否还有更早的}
+        """
+        limit = max(1, int(limit))
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # 多取一条用来判断"还有没有更早的"，比再查一次 COUNT(*) 便宜，
+        # 也避免两次查询之间数据变化导致 has_more 和实际页不一致。
+        if before_id is None:
+            cursor.execute("""
+                           SELECT * FROM messages
+                           WHERE thread_id = ?
+                           ORDER BY id DESC
+                           LIMIT ?
+                           """, (thread_id, limit + 1))
+        else:
+            cursor.execute("""
+                           SELECT * FROM messages
+                           WHERE thread_id = ? AND id < ?
+                           ORDER BY id DESC
+                           LIMIT ?
+                           """, (thread_id, int(before_id), limit + 1))
+
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        rows.reverse()  # 倒序取的，翻回时间正序给前端
+
+        return {"messages": rows, "has_more": has_more}
 
     def get_context_messages(self, thread_id: str, max_tokens: int = 6000,
                              scan_limit: int = 500) -> List[Dict]:
