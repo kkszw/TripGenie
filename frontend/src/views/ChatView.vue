@@ -450,7 +450,13 @@ const {
 } = useSessions()
 
 // ===== 计算属性 =====
+// 会话名来自后端（首轮按第一句提问命名，用户也能在侧边栏改）。
+// 分页之后 messages 里只有最近一页，"第一条 user 消息"已经不代表会话开头了，
+// 所以这个名字要优先用；只有新会话（还没有名字）才退回按消息猜。
+const sessionTitleFromDb = ref('')
 const currentTitle = computed(() => {
+  const name = (sessionTitleFromDb.value || '').trim()
+  if (name && name !== '新对话') return name
   if (messages.value.length === 0) return '新对话'
   const firstUserMsg = messages.value.find(m => m.role === 'user')
   if (firstUserMsg) {
@@ -639,6 +645,7 @@ const loadSessionMessagesFromDB = async (threadId) => {
 
     hasOlderHistory.value = page.hasMore
     olderCursor.value = page.nextBefore
+    sessionTitleFromDb.value = page.title || ''
 
     if (!page.messages.length) {
       messages.value = []
@@ -737,6 +744,7 @@ const clearMessages = () => {
   // 分页状态跟着清：新会话没有"更早的消息"可翻，留着会让按钮错位出现
   hasOlderHistory.value = false
   olderCursor.value = null
+  sessionTitleFromDb.value = ''
 }
 
 // ===== 聚焦输入框 =====

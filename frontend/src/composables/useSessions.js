@@ -110,7 +110,7 @@ const loadSessionMessages = async (threadId, options = {}) => {
         return await api.getSessionMessages(threadId, options)
     } catch (err) {
         console.error('❌ 加载消息失败:', err)
-        return {messages: [], hasMore: false, nextBefore: null}
+        return {messages: [], hasMore: false, nextBefore: null, title: ''}
     }
 }
 

@@ -223,7 +223,9 @@ export const api = {
             messages: data.messages || [],
             hasMore: !!data.has_more,
             // ?? 而不是 ||：id 从 1 开始，不会误判，但用 ?? 语义更准
-            nextBefore: data.next_before ?? null
+            nextBefore: data.next_before ?? null,
+            // 会话名：分页之后前端只剩最近一页，"第一条提问"已经不代表会话开头了
+            title: data.title || ''
         };
     },
 
