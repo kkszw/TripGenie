@@ -109,7 +109,7 @@ pyproject_hooks==1.2.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.2
 python-multipart==0.0.32
-PyYAML==6.0.2
+PyYAML==6.0.4  # 本机 6.0.2，但 kubernetes 36.0.2 要求 >=6.0.3；本机那套是 pip 先装后升级留下的不自洽组合
 rapidocr==3.9.2
 referencing==0.37.0
 regex==2026.5.9
