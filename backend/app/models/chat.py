@@ -4,7 +4,9 @@ from typing import List, Optional, Dict, Any, Annotated
 
 
 class ChatRequest(BaseModel):
-    message: str = Field(description="对话内容")
+    # max_length 是成本护栏，不是体验限制：正常一句话几十字，
+    # 而 1MB 请求体能直接灌进 LLM，token 费用和上下文都会被顶爆。
+    message: str = Field(max_length=4000, description="对话内容")
     # thread_id / context 给默认值：pydantic v2 里 Optional 不加默认值仍是必填，
     # 少传一个字段就直接 422，而这两个字段缺了都能自己兜住。
     thread_id: Optional[str] = Field(default=None, description="会话编号")
