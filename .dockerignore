@@ -9,4 +9,11 @@ frontend
 **/*.pyc
 **/*.pyo
 backend/logs
+
+# 运行时数据不进镜像：会话历史、上传的 PDF 都属于使用者，不是代码。
+# 这不只是体积问题——镜像一旦 push 到公共仓库，别人的聊天记录和文件就跟着公开了。
+# 目录不存在也没关系：checkpointer / _init_db / save_upload 三处都会自建。
+backend/app/data/checkpoints
+backend/app/data/uploads
+
 *.md
