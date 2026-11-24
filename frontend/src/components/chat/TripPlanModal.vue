@@ -86,6 +86,7 @@
                       :attractions="getDayAttractions(day.day || index + 1)"
                       :routes="getDayRoutes(day.day || index + 1)"
                       :center="plan.map_data?.center"
+                      :extract-failed="!!plan.map_data?.extract_failed"
                   />
 
                   <!-- 页码 -->

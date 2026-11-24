@@ -11,8 +11,8 @@
       <span class="day-map-count">{{ attractions.length }} 个景点</span>
     </div>
     <div v-if="isEmpty" class="day-map-empty">
-      <span class="day-map-empty-icon">🧭</span>
-      <span class="day-map-empty-text">这一天没有需要标注的景点，可能是自由活动或返程。</span>
+      <span class="day-map-empty-icon">{{ extractFailed ? '⚠️' : '🧭' }}</span>
+      <span class="day-map-empty-text">{{ emptyText }}</span>
     </div>
     <div
         v-else
@@ -47,7 +47,10 @@ const props = defineProps({
   day: {type: Number, required: true},
   attractions: {type: Array, default: () => []},
   routes: {type: Array, default: () => []},
-  center: {type: Array, default: null}
+  center: {type: Array, default: null},
+  // 后端提取景点失败（不是"这天没有景点"）。两种情况都是空列表，
+  // 但一句"可能是自由活动或返程"会把程序错误说成行程写得不够具体。
+  extractFailed: {type: Boolean, default: false}
 })
 
 const isValidCoord = (coord) =>
@@ -69,6 +72,10 @@ const approxCount = computed(() => (props.attractions || []).filter(a => a && a.
 // 某天一个景点都没提取到（自由活动/返程），就别画一张空白地图，
 // 给一句说明——否则用户只会以为地图坏了。
 const isEmpty = computed(() => !(props.attractions || []).length)
+
+const emptyText = computed(() => props.extractFailed
+    ? '景点数据没能生成，地图暂时不可用。重新打开这条会话会再试一次。'
+    : '这一天没有需要标注的景点，可能是自由活动或返程。')
 
 // 同一坐标的多个景点会互相遮挡，看起来像"少了一个点"
 // （后端以前把查不到坐标的景点全画在城市中心点上，就出现过这种情况）。

@@ -70,6 +70,47 @@ class ParseLlmJsonTest(unittest.TestCase):
             parse_llm_json(None)
 
 
+class ArrayShapeTest(unittest.TestCase):
+    """返回数组时要能解析。
+
+    这一支以前完全没覆盖：景点提取的 prompt 一边说"返回 JSON 数组"、一边给的
+    示例是对象，模型按文字走就返回裸数组，而 parse_llm_json 只会找大括号，
+    根本抓不到——结果是地图静默变空，前端还显示"这一天没有需要标注的景点"。
+    """
+
+    def test_bare_list(self):
+        self.assertEqual(parse_llm_json('[{"name": "栈桥"}]', allow_list=True),
+                         [{"name": "栈桥"}])
+
+    def test_fenced_list(self):
+        text = '```json\n[{"name": "栈桥", "day": 1}]\n```'
+        self.assertEqual(parse_llm_json(text, allow_list=True)[0]["name"], "栈桥")
+
+    def test_list_with_surrounding_prose(self):
+        text = '好的，提取结果如下：\n[{"name": "栈桥"}]\n以上。'
+        self.assertEqual(parse_llm_json(text, allow_list=True)[0]["name"], "栈桥")
+
+    def test_list_not_allowed_by_default(self):
+        """默认只接受对象：行程/槽位/质检拿到的必须是对象，不能因为
+        解析出数组就静默继续（那几个调用方随后都会 .get("days")）。"""
+        with self.assertRaises(ValueError):
+            parse_llm_json('[{"name": "栈桥"}]')
+
+    def test_object_with_inner_array_is_not_truncated(self):
+        """{"attractions": [...]} 必须先取到整个对象。
+
+        一律取第一个 { 到最后一个 } 会撞上反向情况：内容是以 [ 开头时
+        取到的是内层数组；而按"先出现的包裹符"判断，两种形状都能正确区分。
+        """
+        data = parse_llm_json('{"attractions": [{"name": "栈桥"}]}', allow_list=True)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(data["attractions"][0]["name"], "栈桥")
+
+    def test_trailing_garbage_after_object(self):
+        """尾部多一个 } 或一句说明，不该让整条解析失败。"""
+        self.assertEqual(parse_llm_json('{"a": 1} }} 完')["a"], 1)
+
+
 class AsNumberTest(unittest.TestCase):
     """as_number：把模型/用户给的天数、预算宽松转成数字，转不了就当没提供。"""
 

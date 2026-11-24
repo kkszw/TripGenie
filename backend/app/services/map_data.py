@@ -5,7 +5,6 @@
 只有 nodes/map.py 那一层负责读写 state。
 """
 import asyncio
-import json
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -13,6 +12,7 @@ from langchain_core.messages import HumanMessage
 
 from app.config import settings
 from app.core import llm as llm_runtime
+from app.core.json_utils import as_number, parse_llm_json
 from app.core.logging import get_logger
 from app.core.prompts import build_attraction_prompt
 from app.services.amap import geocode_mcp, geocode_rest, plan_driving_route, poi_search_rest
@@ -38,60 +38,91 @@ def build_plan_text(destination: str, plan_data: dict) -> str:
     return plan_text
 
 
+class AttractionExtractionError(Exception):
+    """景点提取失败：响应解析不出预期结构，或模型调用本身报错。
+
+    单独一个异常类型是为了让调用方区分「这天真的没景点」和「提取坏了」：
+    前者正常返回空列表，后者抛这个。两者混在一起时，前端只能统一显示
+    "这一天没有需要标注的景点，可能是自由活动或返程"——把程序错误
+    说成了行程本身没写地点，用户看到的是一个假装正常的空地图。
+    """
+
+
+def normalize_attractions(data) -> List[Dict]:
+    """把模型返回的任意形状归一成景点列表。
+
+    要容错的三种形状（都实测出现过）：
+      {"attractions": [...]}  ← prompt 要求的
+      [...]                   ← 模型按"返回 JSON 数组"理解的
+      ["栈桥", "八大关"]        ← 只给名字的退化形式
+
+    归一在这里做而不是交给调用方，是因为「模型给什么就按什么取」这件事
+    一旦分散到多处，就必然漏掉某一支——2026-11 地图静默变空就是漏了数组分支。
+    """
+    if isinstance(data, list):
+        raw = data
+    elif isinstance(data, dict):
+        raw = data.get("attractions")
+        if not isinstance(raw, list):
+            # 键名可能被写成 items / data / 景点，对象里只有一个数组时直接用它
+            list_values = [v for v in data.values() if isinstance(v, list)]
+            raw = list_values[0] if len(list_values) == 1 else []
+    else:
+        raw = []
+
+    result = []
+    for attr in raw:
+        if not isinstance(attr, dict):
+            # 纯字符串数组时没有 day/city，无法对应到某一天，跳过比瞎猜好
+            continue
+        name = str(attr.get("name") or "").strip()
+        if not name:
+            continue
+        result.append({
+            "name": name,
+            "day": as_number(attr.get("day")) or 1,
+            # 景点所在城市：只给了省份的目的地（"山东"）靠它把地理编码钉到具体城市，
+            # 否则省内同名地点会乱匹配（玉皇顶 → 临沂那座、孔林 → 菏泽那片）
+            "city": str(attr.get("city") or "").strip(),
+            "time": "",
+            "description": "",
+        })
+    return result
+
+
 async def extract_attractions_with_llm(destination: str, plan_data: dict) -> List[Dict]:
-    """使用 LLM 从行程计划中智能提取景点"""
+    """使用 LLM 从行程计划中智能提取景点
+
+    解析不出来时抛 AttractionExtractionError，**不要**返回空列表——
+    空列表是「这天没有可标注的地点」这个合法结论，两者必须分开。
+    """
     prompt = build_attraction_prompt(build_plan_text(destination, plan_data))
 
+    logger.debug("开始用 LLM 提取景点")
+    # 用 llm_extract（streaming=False）：这里的输出是给程序看的中转数据，
+    # 不能进 SSE 正文，否则会跟在行程 JSON 后面一起推给前端。
+    # internal 是第二道保险：万一以后有人图省事又改回 llm，api/chat.py 看到
+    # 这个标记也会跳过，不会再漏进正文。
     try:
-        logger.debug("开始用 LLM 提取景点")
-        # 用 llm_extract（streaming=False）：这里的输出是给程序看的中转数据，
-        # 不能进 SSE 正文，否则会跟在行程 JSON 后面一起推给前端。
-        # internal 是第二道保险：万一以后有人图省事又改回 llm，api/chat.py 看到
-        # 这个标记也会跳过，不会再漏进正文。
         response = await llm_runtime.llm_extract.ainvoke(
             [HumanMessage(content=prompt)], config={"tags": ["internal"]}
         )
-        content = response.content
-
-        logger.debug("景点提取响应", extra={"chars": len(content)})
-
-        # 提取 JSON：优先抓 ```json 围栏，否则退化成最外层大括号
-        import re
-        json_match = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-        if json_match:
-            json_str = json_match.group(1)
-        else:
-            json_match = re.search(r'\{.*\}', content, re.DOTALL)
-            if json_match:
-                json_str = json_match.group()
-            else:
-                logger.warning("无法从 LLM 响应中提取 JSON", extra={"head": content[:120]})
-                return []
-
-        data = json.loads(json_str)
-        attractions = data.get("attractions", [])
-
-        result = []
-        for attr in attractions:
-            result.append({
-                "name": attr.get("name", "").strip(),
-                "day": attr.get("day", 1),
-                # 景点所在城市：只给了省份的目的地（"山东"）靠它把地理编码钉到具体城市，
-                # 否则省内同名地点会乱匹配（玉皇顶 → 临沂那座、孔林 → 菏泽那片）
-                "city": (attr.get("city") or "").strip(),
-                "time": "",
-                "description": ""
-            })
-
-        # 过滤空名称
-        result = [a for a in result if a["name"]]
-
-        logger.info("景点提取完成", extra={"count": len(result)})
-        return result
-
     except Exception as e:
-        logger.exception("LLM 提取景点失败", extra={"err": str(e)})
-        return []
+        logger.exception("景点提取调用失败", extra={"err": str(e)})
+        raise AttractionExtractionError(f"调用失败：{e}") from e
+
+    content = response.content or ""
+    logger.debug("景点提取响应", extra={"chars": len(content)})
+
+    try:
+        data = parse_llm_json(content, allow_list=True)
+    except ValueError as e:
+        logger.warning("景点提取返回无法解析", extra={"head": content[:120], "err": str(e)})
+        raise AttractionExtractionError(f"解析失败：{e}") from e
+
+    result = normalize_attractions(data)
+    logger.info("景点提取完成", extra={"count": len(result)})
+    return result
 
 
 async def geocode_attraction(geo_tool, name: str, region: Region) -> Optional[Dict]:
@@ -367,17 +398,32 @@ async def generate_map_data(state, plan_data: dict) -> Dict:
         # 地图数据依赖 maps_geo / 驾车路线的工具对象，这里保证工具已加载
         await llm_runtime.ensure_tools()
         destination = state.get("destination", "")
+        # 地理编码失败时的兜底坐标（见 .env 的 DEFAULT_MAP_LNG/LAT）。
+        # 提到最前面是因为下面提取失败的早退分支也要用它。
+        base_lng, base_lat = settings.default_map_lng, settings.default_map_lat
 
         # 1. 提取所有景点
-        attractions = await extract_attractions_with_llm(destination, plan_data)
+        try:
+            attractions = await extract_attractions_with_llm(destination, plan_data)
+        except AttractionExtractionError as e:
+            # 提取失败时**不能**继续拿空列表往下跑：那样生成出来的是
+            # {"attractions": [], "routes": []}，前端会照常渲染地图区块并显示
+            # "这一天没有需要标注的景点，可能是自由活动或返程"——把程序错误
+            # 说成了行程本身没写地点。这里显式带 extract_failed 标记，
+            # 前端据此改口说"地图暂时不可用"，用户和排查的人都看得到真相。
+            logger.warning("景点提取失败，本轮返回空地图", extra={"err": str(e)})
+            return {
+                "attractions": [],
+                "routes": [],
+                "destination": destination,
+                "center": [base_lng, base_lat],
+                "extract_failed": True,
+            }
         logger.debug("待定位景点数", extra={"count": len(attractions)})
 
         # 2. 获取景点坐标（使用高德 MCP）
         geo_tool = llm_runtime.tools_by_name.get("maps_geo")
         attractions_with_coords = []
-
-        # 地理编码失败时的兜底坐标（见 .env 的 DEFAULT_MAP_LNG/LAT）
-        base_lng, base_lat = settings.default_map_lng, settings.default_map_lat
 
         # 目的地解析：城市 / 只有省份 / 认不出。
         # 只给了省份时（"帮我规划山东三天"），高德必须拿到省级 adcode 才会把结果
