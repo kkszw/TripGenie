@@ -73,7 +73,10 @@ def known_destinations() -> List[str]:
             }
             _destinations = sorted(values)
         except Exception as exc:  # 库还没建 / 读失败都不该让检索挂掉
-            logger.debug("目的地列表读取失败", extra={"err": str(exc)})
+            # 降级处理而不是抛错：但没有目的地列表，按目的地过滤就全失效，
+            # 召回会退化成全库乱捞，检索质量下降却不报错——必须能在日志里看见。
+            logger.warning("目的地列表读取失败，本次不做目的地过滤",
+                           extra={"err": str(exc)})
             _destinations = []
         _destinations_gen = generation
     return _destinations
@@ -203,7 +206,7 @@ def _keyword_ranking(query: str, top_k: int, scope: str,
     except Exception as exc:
         # 关键词路是增强项：索引建不出来、读坏了，都退回纯向量。
         # 让它把整次规划带走是本末倒置——没有它检索仍然能用，只是差一些。
-        logger.debug("关键词检索失败，本次只用向量路", extra={"err": str(exc)})
+        logger.warning("关键词检索失败，本次只用向量路", extra={"err": str(exc)})
         return []
 
 
@@ -349,7 +352,8 @@ def retrieve_context(query: str, top_k: int = 5,
         except Exception as exc:
             # 用户库还没建（从没人上传过资料）时 collection 不存在，
             # 不该让整次规划因为没有资料而失败。
-            logger.debug("用户资料检索跳过", extra={"user_id": user_id, "err": str(exc)})
+            logger.warning("用户资料检索跳过，本次结果不含该用户上传的资料",
+                           extra={"user_id": user_id, "err": str(exc)})
 
     if hybrid and len(rankings) > 1:
         docs = _merge(_rrf(rankings), top_k, MAX_PER_DOC, higher_is_better=True)

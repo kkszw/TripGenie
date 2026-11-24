@@ -231,7 +231,8 @@ def get_index(scope: str = "public") -> Optional[KeywordIndex]:
         # include=[] 不填充 documents，实测比全量快 3 倍。
         probe = store._collection.get(include=[])
     except Exception as exc:
-        logger.debug("BM25 取文档失败，跳过关键词检索", extra={"err": str(exc)})
+        logger.warning("BM25 取文档失败，跳过关键词检索（本次只有向量路）",
+                       extra={"err": str(exc)})
         return cached[1] if cached else None
 
     ids = probe.get("ids") or []
@@ -253,7 +254,8 @@ def get_index(scope: str = "public") -> Optional[KeywordIndex]:
         try:
             data = store._collection.get(include=["documents", "metadatas"])
         except Exception as exc:
-            logger.debug("BM25 取正文失败，跳过关键词检索", extra={"err": str(exc)})
+            logger.warning("BM25 取正文失败，跳过关键词检索（本次只有向量路）",
+                           extra={"err": str(exc)})
             return None
 
         docs = [Document(page_content=text or "", metadata=meta or {})
