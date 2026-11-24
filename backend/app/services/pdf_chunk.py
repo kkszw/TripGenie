@@ -8,6 +8,10 @@
 
 整篇找不到任何「天」标记时（比如一篇泛泛的城市介绍），降级为按标题/段落切，
 这就退化成常规的递归切分，不会比原来更差。
+
+表格不参与行流切分：它单独成块（kind="table"），按页码插回正文流里。
+表格里没有句号，混进行流会被 _split_long 从中间硬切，一块只剩景点名、
+一块只剩票价；而且跨页的表会把某一天的正文截断。
 """
 import re
 from collections import Counter
@@ -336,6 +340,80 @@ def _split_long(text: str, max_chars: int, overlap: int) -> List[str]:
     return result
 
 
+def _table_blocks(table: Dict, max_chars: int) -> List[str]:
+    """把一张表拆成若干不超过 max_chars 的 Markdown 片段，每片重复表头。
+
+    表格**不能**进 _split_long：那里按「。！？」切句，表格里没有句号，
+    会走 `while len(sentence) > max_chars` 的硬切分支，从表格中间剪断 ——
+    一块只剩景点名、一块只剩票价，单独看都没意义。
+    这里按行切，并且每块都带表头，第二块起才看得懂哪一列是什么。
+    """
+    markdown = str(table.get("markdown") or "").strip()
+    if not markdown:
+        return []
+    lines = [line for line in markdown.splitlines() if line.strip()]
+    # 短表或只有表头几行的一律不拆：拆了每块都不到一行数据
+    if len(markdown) <= max_chars or len(lines) <= 3:
+        return [markdown]
+
+    header, body = lines[:2], lines[2:]
+    # 表头要重复进每一块，预算里必须先扣掉它，否则切出来的块会超上限
+    budget = max(max_chars - sum(len(line) + 1 for line in header), 80)
+    pieces: List[str] = []
+    buffer: List[str] = []
+    size = 0
+    for line in body:
+        if buffer and size + len(line) + 1 > budget:
+            pieces.append("\n".join(header + buffer))
+            buffer, size = [], 0
+        buffer.append(line)
+        size += len(line) + 1
+    if buffer:
+        pieces.append("\n".join(header + buffer))
+    return pieces
+
+
+def _table_documents(pages: Sequence[Dict], base: Dict,
+                     start_index: int, max_chars: int) -> List[Document]:
+    """表格 → 独立块，不进正文的行流切分。
+
+    为什么独立成块：表格一旦混进行流，会和「天」边界、页边界互相干扰 ——
+    跨页的表会把某天的正文截断，而切出来的表格块又缺上下文。
+    独立之后 `kind="table"` 这个字段有四个用途：检索时可单独加权、
+    前端可特殊渲染、评测时可单独统表格命中率、排查时一眼看出块从哪来。
+    """
+    documents: List[Document] = []
+    index = start_index
+    for page in pages:
+        page_no = int(page.get("page") or 0)
+        for order, table in enumerate(page.get("tables") or []):
+            caption = str(table.get("caption") or "").strip()
+            # 首行这句自然语言描述是检索的关键：块里如果只有管道符，
+            # 「沈阳故宫门票多少钱」这类 query 在向量空间里几乎对不上
+            head = f"【第{page_no}页表格】{caption}".rstrip()
+            for piece in _table_blocks(table, max(max_chars - len(head) - 1, 200)):
+                content = f"{head}\n{piece}"
+                documents.append(Document(
+                    page_content=content,
+                    metadata={
+                        **base,
+                        "page_start": page_no,
+                        "page_end": page_no,
+                        # 表格不归属某一天：归了会被当天的段吞掉，
+                        # 明明单独成块却又带 day，检索侧按 day 过滤时会出现
+                        # 「同一个表格两块都命中」
+                        "day": None,
+                        "day_label": None,
+                        "kind": "table",
+                        "table_index": order,
+                        "chunk_index": index,
+                        "char_count": len(content),
+                    },
+                ))
+                index += 1
+    return documents
+
+
 def chunk_pages(pages: Sequence[Dict],
                 metadata: Optional[Dict] = None,
                 max_chars: int = MAX_CHUNK_CHARS,
@@ -344,47 +422,62 @@ def chunk_pages(pages: Sequence[Dict],
     """页面文本 → 检索块。
 
     Args:
-        pages: [{"page": 1, "text": "..."}]，来自 pdf_extract.extract_pages
-        metadata: 附加到每个块的元数据（doc_id / user_id / filename 等）
+        pages: [{"page": 1, "text": "...", "tables": [...]}]，来自 pdf_extract.extract_pages。
+            `tables` 可选，缺省表示该页没有表格（OCR 路径就没有）。
 
     Returns:
-        List[Document]，每个块的 metadata 含 page_start / page_end / day / day_label /
-        chunk_index / char_count。
+        List[Document]，块按页码排序。metadata 含 page_start / page_end / day /
+        day_label / kind / chunk_index / char_count；表格块另有 kind="table"
+        与 table_index。
     """
     base = dict(metadata or {})
     flat = normalize_lines(pages)
-    if not flat:
-        return []
-
-    # 只有能推出「第几天」的标记才算文档有天数结构；纯日期（3月23日）不算，
-    # 否则「开放时间：3月23日至11月15日」这种行会把整篇误判成按天组织的文档。
-    has_day = any((detect_day_label(line) or {}).get("day") for _, line in flat)
-    sections = _absorb_short(
-        _split_sections(flat, has_day, min_chars, max_chars), min_chars)
 
     documents: List[Document] = []
     index = 0
-    for section in sections:
-        text = "\n".join(section["lines"]).strip()
-        if not text:
-            continue
-        for piece in _split_long(text, max_chars, overlap):
-            piece = piece.strip()
-            if not piece:
+
+    if flat:
+        # 只有能推出「第几天」的标记才算文档有天数结构；纯日期（3月23日）不算，
+        # 否则「开放时间：3月23日至11月15日」这种行会把整篇误判成按天组织的文档。
+        has_day = any((detect_day_label(line) or {}).get("day") for _, line in flat)
+        sections = _absorb_short(
+            _split_sections(flat, has_day, min_chars, max_chars), min_chars)
+
+        for section in sections:
+            text = "\n".join(section["lines"]).strip()
+            if not text:
                 continue
-            documents.append(Document(
-                page_content=piece,
-                metadata={
-                    **base,
-                    "page_start": section["page_start"],
-                    "page_end": section["page_end"],
-                    "day": section["day"],
-                    "day_label": section["day_label"],
-                    "chunk_index": index,
-                    "char_count": len(piece),
-                },
-            ))
-            index += 1
+            for piece in _split_long(text, max_chars, overlap):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                documents.append(Document(
+                    page_content=piece,
+                    metadata={
+                        **base,
+                        "page_start": section["page_start"],
+                        "page_end": section["page_end"],
+                        "day": section["day"],
+                        "day_label": section["day_label"],
+                        "kind": "text",
+                        "chunk_index": index,
+                        "char_count": len(piece),
+                    },
+                ))
+                index += 1
+
+    # 表格块。没有 tables 字段的页面等于空转，老语料和 OCR 路径都走这条路，
+    # 产出与改动前完全一致 —— 这是能安全上线的前提。
+    documents.extend(_table_documents(pages, base, index, max_chars))
+
+    if any(doc.metadata.get("kind") == "table" for doc in documents):
+        # 表格属于第 N 页，就排在 N 页正文之后，保证块序与阅读顺序一致。
+        # 第二个键不能写成 `kind != "table"`：False 排在 True 前面，
+        # 表格会跑到同一页正文的前头去。
+        documents.sort(key=lambda doc: (doc.metadata.get("page_start") or 0,
+                                        doc.metadata.get("kind") == "table"))
+        for position, doc in enumerate(documents):
+            doc.metadata["chunk_index"] = position
     return documents
 
 
@@ -392,7 +485,7 @@ def chunk_stats(documents: Sequence[Document]) -> Dict:
     """给 API 返回和自检脚本用的统计。"""
     if not documents:
         return {"chunks": 0, "chars": 0, "avg_chars": 0, "min_chars": 0,
-                "max_chars": 0, "days": 0, "over_limit": 0}
+                "max_chars": 0, "days": 0, "over_limit": 0, "tables": 0}
     sizes = [len(doc.page_content) for doc in documents]
     days = {doc.metadata.get("day") for doc in documents if doc.metadata.get("day")}
     return {
@@ -403,4 +496,5 @@ def chunk_stats(documents: Sequence[Document]) -> Dict:
         "max_chars": max(sizes),
         "days": len(days),
         "over_limit": sum(1 for size in sizes if size > MAX_CHUNK_CHARS),
+        "tables": sum(1 for doc in documents if doc.metadata.get("kind") == "table"),
     }

@@ -15,6 +15,10 @@
   - **OCR 回退**（pypdfium2 渲染 + RapidOCR，慢，单页约 2.6s）：文字层缺失（扫描件）
     或文字层是乱码时使用。
 
+表格单独处理，不跟正文一起拉平（原因见下方「表格」一节）：文字层通道下用
+pdfplumber 的线框检测把真表格转成 Markdown，从正文里剔除后作为独立内容返回；
+OCR 通道拿不到线框结构，表格能力为 0。
+
 为什么需要乱码判断：有些 PDF 的内嵌子集字体 ToUnicode 映射是错的，三种解析器
 （pdfplumber / pypdf / pdfium）会返回**完全一致的错误字符**——实测一份沈阳攻略里
 「的」全变成「癿」、「不」时而正确时而变成「丌」。这种文件不报错、也不缺文字，
@@ -22,6 +26,7 @@
 """
 import re
 import threading
+from collections import Counter
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, List, Union
@@ -52,6 +57,18 @@ GARBLED_MIN_CJK = 80
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
+# ---- 表格 ----
+# 一个区域要被当成「真表格」，必须 ≥3 行、≥2 列、列数基本稳定。
+# 这两个数是按实测定的：pdfplumber 在攻略类 PDF 上报的「表格」几乎全是 1 列，
+# 内容是左侧信息卡片（关键词/费用/天数/舒适程度）和标题装饰框 —— 1 列没有列关系，
+# 转成 Markdown 只是把一行可读文本拆成四行竖排垃圾；2 行的小表（项目/价格）
+# 信息量不足以占掉一个 top_k 名额。
+TABLE_MIN_ROWS = 3
+TABLE_MIN_COLS = 2
+
+# 表名（caption）的取法：表格 bbox 上方这么高的一条窄带。30pt ≈ 一行正文，
+# 攻略里的表格标题基本都紧贴在表上方，取多了会把上一段正文也带进来。
+TABLE_CAPTION_MARGIN = 30
 
 
 class PdfError(Exception):
@@ -74,10 +91,147 @@ class PdfOcrError(PdfError):
     """文字层与 OCR 都拿不到内容。"""
 
 
+# ==================== 表格 ====================
+# 为什么单独抽表格：extract_text() 是按「y 从上到下、行内按 x 拼接」输出纯文本，
+# 表格会被拉平成一串行，列关系在这一步就丢了 ——
+#   | 景点 | 门票 | 开放时间 |
+#   | 沈阳故宫 | 60元 | 8:30-17:00 |
+# 拉平后是「景点 门票 开放时间」「沈阳故宫 60元 8:30-17:00」，
+# 人还能读，但「沈阳故宫门票多少钱」这类 query 在向量空间里对不上，
+# 而且一行超过 MAX_CHUNK_CHARS 时会被 _split_long 从表格中间硬切，
+# 一块只剩景点名、一块只剩票价，单独看都没意义。
+#
+# 做法：先把表格单独转成 Markdown 存成独立块，再从正文里把它们剔除。
+# 顺序不能反 —— 先剔除再判断的话，那些被误判成表格的信息卡片
+# （实测丢过「天数 3天」「费用 500-1000」这类最有用的字段）会一起消失。
+
+
+def is_real_table(rows: List[List], min_rows: int = TABLE_MIN_ROWS,
+                  min_cols: int = TABLE_MIN_COLS) -> bool:
+    """判断 find_tables() 的结果是不是真表格。
+
+    pdfplumber 的线框检测会把「左侧信息卡片」「标题装饰框」也认成表格，
+    这类区域全是 1 列，没有列关系。判据只有三条：
+
+      1. 去掉空行后至少 min_rows 行；
+      2. 出现最多的那个列数 ≥ min_cols；
+      3. 该列数覆盖过半的行 —— 防止「左图右文」这种各行列数参差的排版
+         被当成表格，否则转成 Markdown 后每行的列含义都对不上。
+    """
+    rows = [r for r in (rows or []) if r and any((c or "").strip() for c in r)]
+    if len(rows) < min_rows:
+        return False
+    widths = [len(r) for r in rows]
+    if max(widths) < min_cols:
+        return False
+    dominant_width, dominant_rows = Counter(widths).most_common(1)[0]
+    return dominant_width >= min_cols and dominant_rows >= len(widths) * 0.5
+
+
+def table_to_markdown(rows: List[List]) -> str:
+    """二维单元格 → Markdown 表格。首行当表头，单元格内换行压成空格。
+
+    列数不齐时按表头列数补齐/截断：pdfplumber 遇到合并单元格会返回短行，
+    不补的话 Markdown 管道数不一致，模型读起来会错位。
+    """
+    cleaned = [[(cell or "").replace("\n", " ").strip() for cell in row]
+               for row in (rows or []) if row]
+    if not cleaned:
+        return ""
+    header = cleaned[0]
+    if not any(header):
+        return ""
+    lines = ["| " + " | ".join(header) + " |",
+             "|" + "|".join([" --- "] * len(header)) + "|"]
+    for row in cleaned[1:]:
+        row = (row + [""] * len(header))[:len(header)]
+        lines.append("| " + " | ".join(row) + " |")
+    return "\n".join(lines)
+
+
+def _table_caption(page, bbox, margin: float = TABLE_CAPTION_MARGIN) -> str:
+    """取表格上方窄带里的文字当表名。拿不到就返回空串。
+
+    表名是表格块唯一的自然语言锚点：块里如果只有 `| 景点 | 门票 |`，
+    「沈阳故宫门票多少」这类 query 几乎不可能召回它。
+    """
+    x0, top, x1, _ = bbox
+    if top - margin <= 0:
+        return ""
+    try:
+        strip = page.crop((x0, top - margin, x1, top))
+        text = strip.extract_text() or ""
+    except Exception:          # crop 越界、页面对象损坏等，表名可有可无
+        return ""
+    return " ".join(text.split())[:40]
+
+
+def _drop_areas(page, bboxes: List[tuple]):
+    """剔除中心点落在表格区域内的文字对象，返回剩下的页面。
+
+    用 page.filter() 而不是链式 outside_bbox()：后者每调一次都要和上一步的
+    cropped bbox 求交，多个表格时会累积坐标偏差；filter 只做一次全页扫描，
+    判定用的是原始页面坐标，结果可预测。
+    """
+    if not bboxes:
+        return page
+
+    def keep(obj):
+        if obj.get("object_type") != "char":
+            return True
+        cx = (obj["x0"] + obj["x1"]) / 2.0
+        cy = (obj["top"] + obj["bottom"]) / 2.0
+        for x0, top, x1, bottom in bboxes:
+            if x0 <= cx <= x1 and top <= cy <= bottom:
+                return False
+        return True
+
+    return page.filter(keep)
+
+
+def extract_tables(page) -> List[Dict]:
+    """抽取单页里的真表格，返回 [{markdown, caption, rows, cols, bbox}]。
+
+    没有矢量线框的页面直接跳过：find_tables 默认只认 lines/rects 构成的线框，
+    纯文字页不可能有表格，先判一下能省掉每页几十毫秒的整页扫描。
+    """
+    try:
+        if not page.lines and not page.rects:
+            return []
+        found = page.find_tables()
+    except Exception as exc:      # 单页表格识别失败不该让整份文档解析失败
+        logger.warning("表格识别失败，该页按纯文本处理", extra={"err": str(exc)})
+        return []
+
+    tables: List[Dict] = []
+    for table in found:
+        try:
+            rows = table.extract()
+        except Exception:
+            continue
+        if not is_real_table(rows):
+            continue
+        markdown = table_to_markdown(rows)
+        if not markdown:
+            continue
+        tables.append({
+            "markdown": markdown,
+            "caption": _table_caption(page, table.bbox),
+            "rows": len(rows),
+            "cols": max(len(r) for r in rows if r),
+            "bbox": tuple(table.bbox),
+        })
+    return tables
+
+
 def extract_pages(path: Union[str, Path],
                   max_pages: int = MAX_PAGES,
                   require_text: bool = True) -> List[Dict]:
-    """把 PDF 拆成 [{page, text}]，页码从 1 开始。
+    """把 PDF 拆成 [{page, text, tables}]，页码从 1 开始。
+
+    `text` 是**已剔除表格区域**的正文；`tables` 是本页识别出的真表格
+    （[{markdown, caption, rows, cols, bbox}]，没有就是空列表）。
+    两个字段互补，合起来才是整页内容。
 
     Args:
         require_text: True 时，整份文档文字不足 MIN_TEXT_CHARS 就抛 PdfNoTextError。
@@ -106,7 +260,18 @@ def extract_pages(path: Union[str, Path],
                 )
             for index, page in enumerate(pdf.pages, start=1):
                 # extract_text 返回 None（整页纯图片）而不是空串，必须兜住
-                pages.append({"page": index, "text": page.extract_text() or ""})
+                text = page.extract_text() or ""
+                tables = extract_tables(page)
+                if tables:
+                    # 表格区域从正文里剔掉，内容改由独立的表格块承载。
+                    # 不剔的话同一份内容会出现两次，白占 top_k 名额。
+                    try:
+                        body = _drop_areas(page, [t["bbox"] for t in tables])
+                        text = body.extract_text() or text
+                    except Exception as exc:
+                        logger.warning("表格区域剔除失败，保留原始正文",
+                                       extra={"page": index, "err": str(exc)})
+                pages.append({"page": index, "text": text, "tables": tables})
     except PdfTooManyPagesError:
         raise
     except Exception as exc:  # pdfminer 的异常类型不稳定，按消息文本分类
@@ -115,7 +280,11 @@ def extract_pages(path: Union[str, Path],
             raise PdfEncryptedError("PDF 已加密，无法解析。请先解密或另存为未加密文件") from exc
         raise PdfError(f"PDF 解析失败: {exc}") from exc
 
+    # 表格区域已从 text 里剔除，判断「有没有文字层」时要把表格内容算回来：
+    # 一份纯报价表的 PDF 正文可能不足 20 字，但内容全在表格里，
+    # 只看 text 会误判成扫描件，白跑一遍 OCR（而且 OCR 拿不到表格结构）。
     text_chars = sum(len(str(p["text"]).strip()) for p in pages)
+    text_chars += sum(len(t["markdown"]) for p in pages for t in p.get("tables") or [])
     if require_text and text_chars < MIN_TEXT_CHARS:
         raise PdfNoTextError(
             "这份 PDF 没有可提取的文字（可能是扫描件或图片版）"
@@ -141,8 +310,16 @@ def _in_gb2312(char: str) -> bool:
 
 
 def text_quality(pages: List[Dict]) -> Dict:
-    """统计文本层的健康度，供乱码判断与日志使用。"""
-    text = "\n".join(str(p.get("text") or "") for p in pages)
+    """统计文本层的健康度，供乱码判断与日志使用。
+
+    表格的 Markdown 也算进来：它是这份文档的真实内容，而且表格若是乱码，
+    正文和表格一样乱。Markdown 的管道符是 ASCII，不进 CJK 统计，不影响判据。
+    """
+    blocks = []
+    for page in pages:
+        blocks.append(str(page.get("text") or ""))
+        blocks.extend(str(t.get("markdown") or "") for t in page.get("tables") or [])
+    text = "\n".join(blocks)
     cjk = _CJK_RE.findall(text)
     total = len(cjk)
     rare = sum(1 for char in cjk if not _in_gb2312(char))
