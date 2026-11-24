@@ -5,7 +5,7 @@
 改文案时只需要看这个目录，不用在节点逻辑里翻。
 """
 from app.core.prompts.attraction import build_attraction_prompt
-from app.core.prompts.chat import CHAT_SYSTEM_PROMPT
+from app.core.prompts.chat import CHAT_SYSTEM_PROMPT, SLOTS_NOTE_PREFIX, build_slots_note
 from app.core.prompts.classify import CLASSIFY_SYSTEM_PROMPT
 from app.core.prompts.plan import PLAN_TEMPLATE, build_plan_prompt
 from app.core.prompts.review import CONFLICT_HINT, REVIEW_RULE_TEXT, build_review_prompt
@@ -13,6 +13,7 @@ from app.core.prompts.slots import build_format_prompt, clarify_text
 
 __all__ = [
     "CHAT_SYSTEM_PROMPT",
+    "SLOTS_NOTE_PREFIX",
     "CLASSIFY_SYSTEM_PROMPT",
     "PLAN_TEMPLATE",
     "REVIEW_RULE_TEXT",
@@ -21,5 +22,6 @@ __all__ = [
     "build_format_prompt",
     "build_plan_prompt",
     "build_review_prompt",
+    "build_slots_note",
     "clarify_text",
 ]

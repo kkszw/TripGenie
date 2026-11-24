@@ -13,6 +13,7 @@ from app.config import settings
 from app.core.langgraph_app import get_workflow
 from app.core.logging import bind_context, get_logger, new_trace_id
 from app.core.metrics import RunMetrics
+from app.core.prompts import build_slots_note
 from app.core.security import get_current_user
 from app.core.state import TripState
 from app.models.chat import ChatRequest, ResumeRequest
@@ -174,6 +175,48 @@ def _record_llm(metrics: RunMetrics, event: dict) -> None:
     )
 
 
+def _build_messages(history: list, slots_note: str, user_message: str) -> list:
+    """重建本次喂给图的消息列表。
+
+    抽成纯函数是为了能单独测顺序：slots_note 必须排在历史之后、本轮用户消息之前。
+    它每轮都在变，一旦放到最前，它后面整段历史都无法命中前缀缓存。
+    """
+    # messages 通道带 add_messages reducer，图输入是"追加"而非"覆盖"。
+    # 本项目对话历史每轮从 SQLite 重建，而 checkpoint 里也存着上一轮的 messages，
+    # 不先清空就会叠加成 [H1,A1,H1,A1,H2,...]，历史翻倍、token 翻倍。
+    # RemoveMessage(REMOVE_ALL_MESSAGES) 让 reducer 丢弃 checkpoint 里的旧消息，
+    # 只保留本次传入的完整历史——SQLite 仍是唯一事实来源。
+    messages = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
+    for msg in history:
+        if msg.get("role") == "user":
+            messages.append(HumanMessage(content=msg.get("content")))
+        elif msg.get("role") == "assistant":
+            messages.append(AIMessage(content=msg.get("content")))
+    if slots_note:
+        messages.append(HumanMessage(content=slots_note))
+    messages.append(HumanMessage(content=user_message or ""))
+    return messages
+
+
+async def _load_slots_note(workflow, thread_id: str) -> str:
+    """读上一轮的槽位，拼成一条背景消息；拿不到就返回空串。
+
+    数据源是 LangGraph checkpoint：format_input 把抽出的 destination/days/preferences
+    写进 state，同一 thread_id 下未提供的字段会被保留。所以这里不新建表、
+    也不往 messages 表复制一份——那会变成两份事实来源，迟早对不上。
+
+    读失败一律降级为空串：槽位是背景信息，缺了只是回答少个参照，
+    不该让整轮对话失败。
+    """
+    try:
+        snapshot = await workflow.aget_state({"configurable": {"thread_id": thread_id}})
+    except Exception as exc:
+        logger.warning("读取会话槽位失败，本轮不带已知需求背景",
+                       extra={"err": str(exc)})
+        return ""
+    return build_slots_note((snapshot.values or {}) if snapshot else {})
+
+
 async def _run_stream(thread_id: str,
                       *,
                       user_message: Optional[str] = None,
@@ -237,18 +280,15 @@ async def _run_stream(thread_id: str,
             db.add_message(thread_id, "user", user_message or "")
             logger.debug("用户消息已入库", extra={"history": len(history_messages)})
 
-            # messages 通道带 add_messages reducer，图输入是"追加"而不是"覆盖"。
-            # 本项目的对话历史每轮都从 SQLite 重建，而 checkpoint 里也存着上一轮的
-            # messages，不先清空就会叠加成 [H1,A1,H1,A1,H2,...]，历史翻倍、token 翻倍。
-            # RemoveMessage(REMOVE_ALL_MESSAGES) 让 reducer 丢弃 checkpoint 里的旧消息，
-            # 只保留本次传入的完整历史——SQLite 仍是唯一事实来源。
-            messages = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
-            for msg in history_messages:
-                if msg.get("role") == "user":
-                    messages.append(HumanMessage(content=msg.get("content")))
-                elif msg.get("role") == "assistant":
-                    messages.append(AIMessage(content=msg.get("content")))
-            messages.append(HumanMessage(content=user_message or ""))
+            # slots 来自 checkpoint 里上一轮抽好的结构化字段（目的地/天数/偏好），
+            # 拼成一条背景消息插在历史末尾。没有这一步，模型只能从自然语言历史里
+            # 反推「那边」指哪，或者把上一轮抽过的东西再抽一遍。
+            slots_note = await _load_slots_note(workflow, thread_id)
+            messages = _build_messages(history_messages, slots_note, user_message or "")
+            if slots_note:
+                logger.debug("注入会话状态", extra={"note": slots_note})
+            db.add_message(thread_id, "user", user_message or "")
+            logger.debug("用户消息已入库", extra={"history": len(history_messages)})
 
             graph_input = TripState(
                 user_input=user_message or "",
