@@ -14,6 +14,7 @@ from app.config import settings
 from app.core.langgraph_app import get_workflow
 from app.core.logging import bind_context, get_logger, new_trace_id
 from app.core.metrics import RunMetrics
+from app.core.memory import render_user_memory, schedule_extraction
 from app.core.prompts import build_slots_note
 from app.core.ratelimit import RateLimiter
 from app.core.security import get_current_user
@@ -248,11 +249,20 @@ def _record_llm(metrics: RunMetrics, event: dict) -> None:
     )
 
 
-def _build_messages(history: list, slots_note: str, user_message: str) -> list:
+def _build_messages(history: list, slots_note: str, user_message: str,
+                    memory_note: str = "") -> list:
     """重建本次喂给图的消息列表。
 
-    抽成纯函数是为了能单独测顺序：slots_note 必须排在历史之后、本轮用户消息之前。
-    它每轮都在变，一旦放到最前，它后面整段历史都无法命中前缀缓存。
+    抽成纯函数是为了能单独测顺序：各部分的位置都是有理由的，不是随便拼。
+
+    - **memory_note 紧跟 system（即整段的第 0 条）**：它是用户级、跨会话不变的
+      背景，对同一用户每轮都是同一串字节，可以当成缓存前缀的一部分。如果放到
+      历史之后，它每轮都出现在更靠后的位置，前缀命中会从它那里断开。
+    - **slots_note 排在历史之后、本轮用户消息之前**：它每轮都在变（本轮抽出的
+      目的地/天数），放前面会把后面整段历史都踢出缓存。
+
+    两者不能合并成一条：一个是"这个人长期如此"，一个是"这次要去哪"，
+    混在一起后模型分不清哪句该被本轮推翻。
     """
     # messages 通道带 add_messages reducer，图输入是"追加"而非"覆盖"。
     # 本项目对话历史每轮从 SQLite 重建，而 checkpoint 里也存着上一轮的 messages，
@@ -260,6 +270,8 @@ def _build_messages(history: list, slots_note: str, user_message: str) -> list:
     # RemoveMessage(REMOVE_ALL_MESSAGES) 让 reducer 丢弃 checkpoint 里的旧消息，
     # 只保留本次传入的完整历史——SQLite 仍是唯一事实来源。
     messages = [RemoveMessage(id=REMOVE_ALL_MESSAGES)]
+    if memory_note:
+        messages.append(HumanMessage(content=memory_note))
     for msg in history:
         if msg.get("role") == "user":
             messages.append(HumanMessage(content=msg.get("content")))
@@ -350,14 +362,28 @@ async def _run_stream(thread_id: str,
             history_messages = db.get_context_messages(
                 thread_id, max_tokens=settings.chat_history_max_tokens
             )
+
+            # 长期档案要先读：下面的后台抽取会写同一张表，先读才能保证这一轮
+            # 注入的是"之前已经记住的"，而不是本轮刚说完、还没被用户确认的话。
+            # 读失败降级为空串（见 core/memory.py），不让它影响整轮对话。
+            memory_note = render_user_memory(user_id)
+
             db.add_message(thread_id, "user", user_message or "")
             logger.debug("用户消息已入库", extra={"history": len(history_messages)})
+
+            # 抽取挂后台、不 await：这是一次纯内部调用，让用户为它多等一两秒
+            # 不值得。放在落库之后，是为了抽取失败时至少用户消息还在，
+            # 下一轮说到同类话题时还能补抽一次。
+            schedule_extraction(user_id, thread_id, user_message or "")
 
             # slots 来自 checkpoint 里上一轮抽好的结构化字段（目的地/天数/偏好），
             # 拼成一条背景消息插在历史末尾。没有这一步，模型只能从自然语言历史里
             # 反推「那边」指哪，或者把上一轮抽过的东西再抽一遍。
             slots_note = await _load_slots_note(workflow, thread_id)
-            messages = _build_messages(history_messages, slots_note, user_message or "")
+            messages = _build_messages(history_messages, slots_note, user_message or "",
+                                       memory_note)
+            if memory_note:
+                logger.debug("注入长期档案", extra={"note": memory_note})
             if slots_note:
                 logger.debug("注入会话状态", extra={"note": slots_note})
 

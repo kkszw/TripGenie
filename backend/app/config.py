@@ -40,6 +40,17 @@ class Settings(BaseSettings):
     rate_limit_burst: int = int(os.getenv("RATE_LIMIT_BURST", "3"))
     rate_limit_max_concurrent: int = int(os.getenv("RATE_LIMIT_MAX_CONCURRENT", "2"))
 
+    # ===== 用户长期档案（跨会话记忆）=====
+    # 关掉时既不读也不抽：单测必须能关，否则共享 user_id 的用例会互相污染，
+    # 出现"今天过明天挂"的随机失败。
+    user_memory_enabled: bool = os.getenv(
+        "USER_MEMORY_ENABLED", "true").lower() in ("1", "true", "yes")
+    # 注入模型的档案 token 上限（0 = 不限制）。实测 12 条经历约 150 token；
+    # 200 能放下十几条，超出按「硬约束优先」砍偏好。
+    # 这个预算和 chat_history_max_tokens 是两份互不相干的账：档案插在历史之前，
+    # 不参与那 6000 的截断，所以必须单独设。
+    user_memory_max_tokens: int = int(os.getenv("USER_MEMORY_MAX_TOKENS", "200"))
+
     # ===== 向量化：百炼 text-embedding-v4（OpenAI 兼容模式）=====
     embedding_api_key: str = os.getenv("EMBEDDING_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
     embedding_base_url: str = os.getenv(

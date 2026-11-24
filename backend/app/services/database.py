@@ -191,6 +191,29 @@ class DatabaseService:
                            ON sessions (user_id)
                        """)
 
+        # 5. 用户长期档案（跨会话记忆）
+        # 为什么不从 sessions/messages 现算：那两张表记的是"发生过什么"，这张表
+        # 记的是"由此得出的结论"。现算意味着每轮扫全部历史，而且结论随上下文
+        # 摇摆——同一句「不吃辣」在不同会话里抽出来的措辞不一样，注入进 prompt
+        # 的字节就不一样，缓存前缀跟着失效。
+        #
+        # 主键用 (user_id, key) 而不是自增 id：key 是固定枚举
+        # （见 core/prompts/memory.py 的 MEMORY_KEYS），一个用户一个键只该有一个值，
+        # 改主意就是覆盖。允许一个键多行的话「不吃辣」和「能吃辣了」会并存，
+        # 注入时自相矛盾，模型只能二选一瞎猜。
+        cursor.execute("""CREATE TABLE IF NOT EXISTS user_memory
+                          (
+                              user_id          TEXT NOT NULL,
+                              key              TEXT NOT NULL,
+                              category         TEXT NOT NULL,
+                              value            TEXT NOT NULL,
+                              source           TEXT,
+                              source_thread_id TEXT,
+                              created_at       TEXT NOT NULL,
+                              updated_at       TEXT NOT NULL,
+                              PRIMARY KEY (user_id, key)
+                          )""")
+
         conn.commit()
         conn.close()
         logger.info("数据库初始化完成", extra={"path": str(self.db_path)})
@@ -535,6 +558,81 @@ class DatabaseService:
 
         return affected > 0
 
+
+    # ==================== 用户长期档案（跨会话记忆） ====================
+
+    def get_user_memory(self, user_id: str) -> List[Dict]:
+        """取一个用户的长期档案。
+
+        排序必须是确定的，而且这里就把优先级定下来：硬约束在前、偏好在后，
+        同类按 key 字典序。这条消息会插在 system 之后当缓存前缀，用 updated_at
+        排序的话，一条记忆被 touch 一下顺序就变，同一用户下一轮的前缀就和上
+        一轮对不上——缓存全部失效，输入价差 50 倍。
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+                       SELECT *
+                       FROM user_memory
+                       WHERE user_id = ?
+                       ORDER BY CASE category WHEN 'constraint' THEN 0 ELSE 1 END, key
+                       """, (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def upsert_user_memory(self, user_id: str, key: str, value: str,
+                           category: str = "preference", source: str = "chat",
+                           source_thread_id: Optional[str] = None) -> bool:
+        """写入或覆盖一条记忆。返回「值真的变了」才算 True。
+
+        为什么带 `WHERE user_memory.value <> excluded.value`：抽取是每轮都可能跑
+        的后台任务，同一句「不吃辣」会被反复抽出来。不加这个条件，每条记忆的
+        updated_at 每轮都在跳，等于一直在告诉后来读它的人"这条刚更新过"，
+        真出问题时反而分不清哪些是最近改的。
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        now = datetime.now().isoformat()
+        cursor.execute("""
+                       INSERT INTO user_memory
+                       (user_id, key, category, value, source, source_thread_id,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT (user_id, key) DO UPDATE SET
+                           value            = excluded.value,
+                           category         = excluded.category,
+                           source           = excluded.source,
+                           source_thread_id = excluded.source_thread_id,
+                           updated_at       = excluded.updated_at
+                       WHERE user_memory.value <> excluded.value
+                       """, (user_id, key, category, value, source, source_thread_id,
+                             now, now))
+        affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return affected > 0
+
+    def delete_user_memory(self, user_id: str, key: str) -> bool:
+        """删掉一条记忆。用户改主意（"我现在能吃辣了"）走这里。"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM user_memory WHERE user_id = ? AND key = ?",
+                       (user_id, key))
+        affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return affected > 0
+
+    def clear_user_memory(self, user_id: str) -> int:
+        """清空一个用户的全部记忆，返回删掉的条数。"""
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM user_memory WHERE user_id = ?", (user_id,))
+        affected = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return affected
 
     # ==================== 用户资料（PDF 知识库） ====================
 
